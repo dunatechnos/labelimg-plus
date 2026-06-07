@@ -496,8 +496,8 @@ LabelImg Plus aims to become a complete annotation platform by combining:
 - Advanced Dataset Review Tools
 
 All within a single workflow.
-```
 
+---
 ## 👨‍💻 Authors & Credits
 
 ### LabelImg Plus (Enhanced Version)
