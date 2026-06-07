@@ -441,6 +441,63 @@ This makes it especially useful for large datasets and repetitive annotation wor
 
 ---
 
+## 🚀 Roadmap
+
+LabelImg Plus is actively being developed. The following features are planned for future releases.
+
+### Version 1.x (Current)
+- [x] Annotation Helper
+- [x] Delete Class / Delete Specific Label
+- [x] Label Propagation
+- [x] Change Class
+- [x] Normal Prediction
+- [x] Crop Prediction
+- [x] Select Area Mode
+- [x] Multiple YOLO Model Support
+- [x] Undo System
+
+---
+
+### Version 2.0 (Planned)
+
+#### 📦 Multi-Format Annotation Support
+Currently LabelImg Plus supports YOLO format only.
+
+Future versions will add support for:
+- [ ] Pascal VOC (.xml)
+- [ ] CreateML (.json)
+
+This will allow users to work with multiple annotation formats without converting datasets manually.
+
+---
+
+#### 🔍 FiftyOne Integration
+Planned integration with Voxel51 FiftyOne.
+
+Features may include:
+- [ ] Open datasets directly in FiftyOne
+- [ ] Visual dataset inspection
+- [ ] Annotation quality review
+- [ ] Model prediction analysis
+- [ ] Dataset filtering and search
+- [ ] Error detection and dataset cleanup
+
+---
+
+### Future Vision
+
+LabelImg Plus aims to become a complete annotation platform by combining:
+
+- Manual Annotation
+- Smart Annotation Helper
+- AI-Assisted Labeling
+- Multi-Format Support
+- FiftyOne Dataset Management
+- Advanced Dataset Review Tools
+
+All within a single workflow.
+```
+
 ## 👨‍💻 Authors & Credits
 
 ### LabelImg Plus (Enhanced Version)
