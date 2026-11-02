@@ -401,6 +401,7 @@ class AnnotationApp(QWidget):
 
         # UI build
         self.build_ui()
+        self.on_action_changed("delete")  # contextual controls: only Delete widgets visible
 
         # keyboard shortcuts
         self.setup_shortcuts()
@@ -506,11 +507,12 @@ class AnnotationApp(QWidget):
 
         action_row.addWidget(radio_wrap)
 
-        # Old class dropdown (for change)
+        # Old class dropdown (Delete/Change)
         line_old = QHBoxLayout()
         self.combo_old_class = QComboBox()
         self.refresh_full_class_list()
-        line_old.addWidget(QLabel("Old Class:"))
+        self.lbl_old_class = QLabel("Old Class:")
+        line_old.addWidget(self.lbl_old_class)
         line_old.addWidget(self.combo_old_class)
         action_row.addLayout(line_old)
 
@@ -518,7 +520,9 @@ class AnnotationApp(QWidget):
         line_area_class = QHBoxLayout()
         self.combo_area_class = QComboBox()
         self.combo_area_class.setVisible(False)
-        line_area_class.addWidget(QLabel("Area Class:"))
+        self.lbl_area_class = QLabel("Area Class:")
+        self.lbl_area_class.setVisible(False)
+        line_area_class.addWidget(self.lbl_area_class)
         line_area_class.addWidget(self.combo_area_class)
         action_row.addLayout(line_area_class)
 
@@ -526,9 +530,24 @@ class AnnotationApp(QWidget):
         line_new = QHBoxLayout()
         self.combo_new_class = QComboBox()
         self.refresh_full_class_list()
-        line_new.addWidget(QLabel("New Class:"))
+        self.lbl_new_class = QLabel("New Class:")
+        line_new.addWidget(self.lbl_new_class)
         line_new.addWidget(self.combo_new_class)
         action_row.addLayout(line_new)
+
+        # SAM3 Track options (direction; only for sam3track action)
+        line_dir = QHBoxLayout()
+        self.lbl_direction = QLabel("Direction:")
+        self.combo_direction = QComboBox()
+        self.combo_direction.addItems(["Forward", "Backward", "Both"])
+        self.combo_direction.setToolTip("Forward: current->End | Backward: 1->current | Both: full span")
+        line_dir.addWidget(self.lbl_direction)
+        line_dir.addWidget(self.combo_direction)
+        action_row.addLayout(line_dir)
+        self.lbl_sam3_hint = QLabel("Tip: select 1+ boxes (Ctrl-click), set End, Apply.")
+        self.lbl_sam3_hint.setWordWrap(True)
+        self.lbl_sam3_hint.setObjectName("statusLabel")
+        action_row.addWidget(self.lbl_sam3_hint)
 
         # Apply button centered
         self.btn_apply = QPushButton("Apply Action")
@@ -564,15 +583,18 @@ class AnnotationApp(QWidget):
         merge_row.addWidget(self.combo_merge)
         model_v.addLayout(merge_row)
 
-        # SAM3 text prompt (visible only when SAM3 model selected)
+        # SAM3 classes multi-select (visible only when SAM3 model selected).
+        # No free typing: prompts come only from classes.txt, multiple allowed.
         sam3_row = QHBoxLayout()
-        self.label_sam3_prompt = QLabel("Text:")
-        self.line_sam3_prompt = QLineEdit()
-        self.line_sam3_prompt.setPlaceholderText("e.g. person")
-        self.line_sam3_prompt.setToolTip("SAM3 text prompt. Predicted boxes take the 'New Class' below.")
+        self.label_sam3_prompt = QLabel("Classes:")
+        self.list_sam3_classes = QListWidget()
+        self.list_sam3_classes.setSelectionMode(QListWidget.ExtendedSelection)
+        self.list_sam3_classes.setFixedHeight(90)
+        self.list_sam3_classes.setToolTip("Ctrl/Shift-click: select classes to detect")
         sam3_row.addWidget(self.label_sam3_prompt)
-        sam3_row.addWidget(self.line_sam3_prompt)
+        sam3_row.addWidget(self.list_sam3_classes)
         model_v.addLayout(sam3_row)
+        self._refresh_sam3_class_list()
         self._update_sam3_prompt_ui()
 
         reload_row = QHBoxLayout()
@@ -844,6 +866,12 @@ class AnnotationApp(QWidget):
             self.combo_old_class.clear(); self.combo_old_class.addItems(items)
         if hasattr(self, "combo_new_class"):
             self.combo_new_class.clear(); self.combo_new_class.addItems(items)
+        self._refresh_sam3_class_list()
+
+    def _refresh_sam3_class_list(self):
+        if hasattr(self, "list_sam3_classes"):
+            self.list_sam3_classes.clear()
+            self.list_sam3_classes.addItems([f"{i}:{n}" for i, n in enumerate(self.classes)])
 
     def refresh_models(self):
         self.models = scan_models()
@@ -859,7 +887,7 @@ class AnnotationApp(QWidget):
 
     def _update_sam3_prompt_ui(self, *a):
         is_sam3 = hasattr(self, "combo_models") and self.combo_models.currentText() == SAM3_MODEL_ENTRY
-        for w in (getattr(self, "label_sam3_prompt", None), getattr(self, "line_sam3_prompt", None)):
+        for w in (getattr(self, "label_sam3_prompt", None), getattr(self, "list_sam3_classes", None)):
             if w is not None:
                 w.setVisible(bool(is_sam3))
 
@@ -1084,6 +1112,7 @@ class AnnotationApp(QWidget):
         # hide area class combo
         if hasattr(self, "combo_area_class"):
             self.combo_area_class.setVisible(False)
+            self.lbl_area_class.setVisible(False)
 
     def update_area_classes(self):
         # compute classes inside selection_area and populate combo_area_class (and show)
@@ -1091,6 +1120,7 @@ class AnnotationApp(QWidget):
             if hasattr(self, "combo_area_class"):
                 self.combo_area_class.clear()
                 self.combo_area_class.setVisible(False)
+                self.lbl_area_class.setVisible(False)
             self.label_status.setText("No area selected")
             return
         found = []
@@ -1107,9 +1137,11 @@ class AnnotationApp(QWidget):
             self.combo_area_class.clear()
             self.combo_area_class.addItems(items)
             self.combo_area_class.setVisible(True)
+            self.lbl_area_class.setVisible(True)
             self.label_status.setText("Area selected. Classes: " + ", ".join([self.classes[i] for i in found if i < len(self.classes)]))
         else:
             self.combo_area_class.clear(); self.combo_area_class.setVisible(True)
+            self.lbl_area_class.setVisible(True)
             self.combo_area_class.addItem("(no classes in area)")
             self.label_status.setText("Area selected but no known classes inside.")
 
@@ -1135,21 +1167,29 @@ class AnnotationApp(QWidget):
 
     # ---------------- action change behavior ----------------
     def on_action_changed(self, text):
-        # Show/hide controls per action
-        if text == "change":
-            self.combo_old_class.setVisible(True)
-            self.combo_new_class.setVisible(True)
-        else:
-            self.combo_old_class.setVisible(True)
-            self.combo_new_class.setVisible(False)
+        # Contextual controls: only the widgets relevant to the
+        # selected action stay visible.
+        show_old = text in ("delete", "change")
+        show_new = text == "change"
+        show_dir = text == "sam3track"
+        self.lbl_old_class.setVisible(show_old)
+        self.combo_old_class.setVisible(show_old)
+        self.lbl_new_class.setVisible(show_new)
+        self.combo_new_class.setVisible(show_new)
+        self.lbl_direction.setVisible(show_dir)
+        self.combo_direction.setVisible(show_dir)
+        self.lbl_sam3_hint.setVisible(show_dir)
+        if text != "change":
             self.combo_area_class.setVisible(False)
+            self.lbl_area_class.setVisible(False)
         if text == "propagate":
             self.label_status.setText("Propagate mode: select multiple boxes (Ctrl/Shift-click).")
         elif text == "sam3track":
-            self.label_status.setText("SAM3 Track: select exactly 1 box, set End index, Apply = track forward.")
+            self.label_status.setText("SAM3 Track: select 1+ boxes, pick direction, Apply = track.")
         else:
             # clear message but not override useful status
-            if self.label_status.text().startswith("Propagate mode"):
+            if self.label_status.text().startswith("Propagate mode") or \
+               self.label_status.text().startswith("SAM3 Track"):
                 self.label_status.setText("")
 
     # ---------------- Apply action (delete/propagate/change) ----------------
@@ -1164,7 +1204,7 @@ class AnnotationApp(QWidget):
         elif act == "change":
             self.action_change(start_idx, end_idx)
         elif act == "sam3track":
-            self.action_sam3_track(start_idx, end_idx)
+            self.action_sam3_track()
         else:
             self.label_status.setText("Unknown action.")
 
@@ -1391,32 +1431,51 @@ class AnnotationApp(QWidget):
         self.label_status.setText(f"Changed {changed_total} labels.")
         self.load_image(self.current_index)
 
-    # --------------- SAM3 single-object tracking ---------------
-    def action_sam3_track(self, start_idx, end_idx):
-        """Track the single selected box from current image forward to end_idx.
+    # --------------- SAM3 single/multi-object tracking ---------------
+    def action_sam3_track(self):
+        """Track selected boxes (1..N) forward/backward/both across images.
 
-        Frames = consecutive images in the folder. Target frames keep their
-        existing labels; same-class boxes overlapping the tracked box
-        (IoU>0.3) are replaced by it. Undo supported via snapshot.
+        Current image = anchor. Forward: cur->End. Backward: 1->cur.
+        Both: two passes merged. Each box runs its own session with a
+        box-only prompt (measured: text breaks box tracking) and keeps
+        its own class. Undo supported via snapshot.
         """
         selected = [it.parts for it in self.bbox_items if it.isSelected()]
-        if len(selected) != 1:
-            self.label_status.setText("SAM3 Track: select exactly 1 box on the current image.")
+        if not selected:
+            self.label_status.setText("SAM3 Track: select at least 1 box on the current image.")
             return
-        if end_idx <= start_idx:
-            self.label_status.setText("SAM3 Track: set End index greater than current image.")
+        direction = {"Forward": "forward", "Backward": "backward", "Both": "both"}.get(
+            self.combo_direction.currentText(), "forward")
+        cur = self.current_index
+        if direction == "forward":
+            lo, hi = cur, int(self.spin_end.value())
+        elif direction == "backward":
+            lo, hi = 1, cur
+        else:
+            lo, hi = 1, int(self.spin_end.value())
+        lo, hi = max(1, lo), min(len(self.images), max(hi, cur))
+        if lo > hi:
+            self.label_status.setText("SAM3 Track: bad range.")
             return
         try:
             Sam3PropagateThread, _ = _import_sam3()
         except Exception as e:
             self.label_status.setText(f"SAM3 unavailable (run in sam3 env with GPU): {e}")
             return
+        items = []
+        for parts in selected:
+            try:
+                cls_id = int(float(parts[0]))
+            except Exception:
+                continue
+            cls_name = self.classes[cls_id] if cls_id < len(self.classes) else None
+            items.append((parts, cls_name))
+        if not items:
+            self.label_status.setText("SAM3 Track: no valid boxes.")
+            return
         images = list_images()
-        cls_id = int(float(selected[0][0]))
-        cls_name = self.classes[cls_id] if cls_id < len(self.classes) else None
         self.sam3_thread = Sam3PropagateThread(
-            images, IMAGES_DIR, LABELS_DIR, start_idx, end_idx, selected[0],
-            class_name=cls_name)
+            images, IMAGES_DIR, LABELS_DIR, cur, lo, hi, items, direction=direction)
         self.sam3_thread.progress.connect(self.on_predict_progress)
         self.sam3_thread.finished.connect(self.on_predict_finished)
         self.sam3_thread.error.connect(self.on_predict_error)
@@ -1470,30 +1529,34 @@ class AnnotationApp(QWidget):
         self.label_status.setText("Predict started...")
 
     def _on_predict_sam3(self, images, sel_area, start_idx, end_idx, merge_mode):
-        """SAM3 text-prompt detection; predicted boxes get the New-Class."""
-        prompt = self.line_sam3_prompt.text().strip()
-        if not prompt:
-            self.label_status.setText("SAM3: enter a text prompt first (e.g. person).")
-            return
-        try:
-            cls_idx = int(self.combo_new_class.currentText().split(":")[0])
-            cls_name = self.classes[cls_idx] if cls_idx < len(self.classes) else str(cls_idx)
-        except Exception:
-            self.label_status.setText("SAM3: pick a valid New Class for predicted boxes.")
+        """SAM3 text-prompt detection; one prompt per selected class, each
+        box keeps its own class (no more everything-becomes-index-0)."""
+        sel = []
+        for it in self.list_sam3_classes.selectedItems():
+            try:
+                ci = int(it.text().split(":")[0])
+                if 0 <= ci < len(self.classes):
+                    sel.append((self.classes[ci], ci, self.classes[ci]))
+            except Exception:
+                continue
+        # de-dup, keep order
+        prompts = list(dict.fromkeys(sel))
+        if not prompts:
+            self.label_status.setText("SAM3: select at least 1 class from the Classes list.")
             return
         try:
             _, Sam3TextModel = _import_sam3()
         except Exception as e:
             self.label_status.setText(f"SAM3 unavailable (run in sam3 env with GPU): {e}")
             return
-        key = (prompt, cls_idx)
+        key = tuple(sorted(p[1] for p in prompts))
         if key in self.sam3_model_cache:
             adapter = self.sam3_model_cache[key]
         else:
             try:
                 self.label_status.setText("Loading SAM3 image model (16-bit)...")
                 QApplication.processEvents()
-                adapter = Sam3TextModel(prompt, cls_idx, cls_name)
+                adapter = Sam3TextModel(prompts)
                 self.sam3_model_cache[key] = adapter
             except Exception as e:
                 self.label_status.setText(f"SAM3 model load failed: {e}")

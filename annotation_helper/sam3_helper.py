@@ -142,13 +142,22 @@ class _Result:
 
 
 class Sam3TextModel:
-    """Ultralytics-like wrapper: model(bgr_image) -> [result with .boxes]."""
+    """Ultralytics-like wrapper: model(bgr_image) -> [result with .boxes].
 
-    def __init__(self, prompt, class_idx, class_name,
-                 score_thres=SAM3_SCORE_THRES, dtype=SAM3_DTYPE):
-        self.prompt = prompt
-        self.class_idx = int(class_idx)
-        self.names = {0: class_name}  # remap target (PredictThread uses this)
+    prompts: list of (text, cls_idx, cls_name) — one detection pass per
+    class; boxes carry the prompt position so PredictThread remaps each
+    box to its own class (no more everything-becomes-0).
+    """
+
+    def __init__(self, prompts, score_thres=SAM3_SCORE_THRES, dtype=SAM3_DTYPE):
+        if isinstance(prompts, tuple):
+            prompts = [prompts]
+        if len(prompts) == 3 and isinstance(prompts[0], str):
+            prompts = [prompts]  # single (text, idx, name) passed flat
+        self.prompts = [(str(t), int(ci), str(cn)) for (t, ci, cn) in prompts]
+        if not self.prompts:
+            raise ValueError("SAM3: no classes selected")
+        self.names = {i: cn for i, (_, _, cn) in enumerate(self.prompts)}
         self.score_thres = score_thres
         half_ckpt = ensure_half_ckpt(dtype, version="sam3")
         model = build_sam3_image_model(
@@ -172,31 +181,33 @@ class Sam3TextModel:
         with torch.inference_mode():
             with self._ctx():
                 state = self.processor.set_image(pil)
+        all_items = []
+        for pi, (prompt, _, _) in enumerate(self.prompts):
             with torch.inference_mode():
                 with self._ctx():
-                    result = self.processor.set_text_prompt(state=state, prompt=self.prompt)
-        scores = result.get("scores", result.get("out_probs"))
-        boxes = result.get("boxes", result.get("out_boxes_xyxy"))
-        if scores is None:
-            return [_Result(_Boxes([]))]
-        scores = np.asarray(torch.as_tensor(scores).detach().float().cpu().numpy()).reshape(-1)
-        if boxes is not None:
-            boxes = np.asarray(torch.as_tensor(boxes).detach().float().cpu().numpy()).reshape(-1, 4)
-        else:
-            boxes = np.zeros((0, 4))
-        items = []
-        for i, s in enumerate(scores):
-            if float(s) < self.score_thres or i >= len(boxes):
+                    result = self.processor.set_text_prompt(state=state, prompt=prompt)
+            scores = result.get("scores", result.get("out_probs"))
+            boxes = result.get("boxes", result.get("out_boxes_xyxy"))
+            if scores is None:
                 continue
-            x1, y1, x2, y2 = [float(v) for v in boxes[i]]
-            x1 = max(0, min(w - 1, x1)); y1 = max(0, min(h - 1, y1))
-            x2 = max(0, min(w - 1, x2)); y2 = max(0, min(h - 1, y2))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            items.append((0, x1, y1, x2, y2))
-        # same-class NMS (keep it dependency-free)
-        items = _nms(items)
-        return [_Result(_Boxes(items))]
+            scores = np.asarray(torch.as_tensor(scores).detach().float().cpu().numpy()).reshape(-1)
+            if boxes is not None:
+                boxes = np.asarray(torch.as_tensor(boxes).detach().float().cpu().numpy()).reshape(-1, 4)
+            else:
+                boxes = np.zeros((0, 4))
+            items = []
+            for i, s in enumerate(scores):
+                if float(s) < self.score_thres or i >= len(boxes):
+                    continue
+                x1, y1, x2, y2 = [float(v) for v in boxes[i]]
+                x1 = max(0, min(w - 1, x1)); y1 = max(0, min(h - 1, y1))
+                x2 = max(0, min(w - 1, x2)); y2 = max(0, min(h - 1, y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                items.append((pi, x1, y1, x2, y2))
+            # same-class NMS (keep it dependency-free)
+            all_items.extend(_nms(items))
+        return [_Result(_Boxes(all_items))]
 
 
 def _nms(items, iou_thres=SAM3_NMS_IOU):
@@ -245,27 +256,33 @@ class Sam3PropagateThread(QThread):
     error = pyqtSignal(str)
     snapshot = pyqtSignal(dict)
 
-    def __init__(self, images, images_dir, labels_dir, start_idx, end_idx,
-                 box_parts, class_name=None, score_thres=0.15):
-        """box_parts: [cls, xc, yc, w, h] strings (normalized, from start image).
+    def __init__(self, images, images_dir, labels_dir, cur_idx, lo_idx, hi_idx,
+                 items, direction="forward", score_thres=0.15):
+        """Multi-box forward/backward tracking (single object per session).
 
-        class_name: box ke class ka naam (classes.txt se). Ye text prompt ke
-        roop me box ke SAATH bheja jata hai — box-only prompt par tracker
-        aage ke frames me object ko output hi nahi karta (measured), jabki
-        box+text par poori tarah track hota hai.
-        score_thres intentionally low (0.15): tracker confidence fluctuates
-        frame to frame; gaps are filled by interpolation below instead of
-        dropping boxes (annotator deletes false positives faster than
-        drawing missing boxes).
+        images: full folder list (1-based indices). Current image = cur_idx.
+        Range [lo_idx..hi_idx] staged into one clip; tracking starts at cur.
+        items: list of (box_parts, class_name_or_None); box_parts =
+            [cls, xc, yc, w, h] strings (normalized, from current image).
+        direction: "forward" (cur->hi), "backward" (lo->cur), "both".
+
+        Measured behavior (RTX 3050, 5-frame probes):
+        - box-only prompt + masklet confirmation OFF => tracks (0.97 prob)
+        - any text in prompt => box-anchored object lost (0 boxes)
+        So each box runs its OWN session with box-only prompt; each box
+        keeps its own class (no obj-id mapping needed).
+        score_thres low (0.15) + interior-gap interpolation: annotator
+        deletes false positives faster than drawing missing boxes.
         """
         super().__init__()
         self.images = images
         self.images_dir = images_dir
         self.labels_dir = labels_dir
-        self.start_idx = start_idx
-        self.end_idx = end_idx
-        self.box_parts = box_parts
-        self.class_name = class_name
+        self.cur_idx = cur_idx
+        self.lo_idx = lo_idx
+        self.hi_idx = hi_idx
+        self.items = items
+        self.direction = direction if direction in ("forward", "backward", "both") else "forward"
         self.score_thres = score_thres
 
     def _read_labels(self, name):
@@ -283,9 +300,10 @@ class Sam3PropagateThread(QThread):
         tmpdir = tempfile.mkdtemp(prefix="sam3track_")
         predictor = None
         try:
-            names = self.images[self.start_idx - 1:self.end_idx]
-            if not names:
-                self.finished.emit(0, "No target images.")
+            lo, hi, cur = self.lo_idx, self.hi_idx, self.cur_idx
+            names = self.images[lo - 1:hi]
+            if not names or cur < lo or cur > hi:
+                self.finished.emit(0, "Bad range.")
                 return
             # stage frames: uniform size mp4 (first frame's size)
             first = cv2.imread(os.path.join(self.images_dir, names[0]))
@@ -303,10 +321,6 @@ class Sam3PropagateThread(QThread):
                 vw.write(fr)
             vw.release()
 
-            cls_id = int(float(self.box_parts[0]))
-            xc, yc, bw, bh = map(float, self.box_parts[1:5])
-            box_xywh_rel = [[xc - bw / 2, yc - bh / 2, bw, bh]]  # x,y,w,h rel
-
             half_ckpt = ensure_half_ckpt(SAM3_DTYPE, version="sam3.1")
             predictor = build_sam3_multiplex_video_predictor(
                 checkpoint_path=half_ckpt, use_fa3=False, use_rope_real=True,
@@ -314,93 +328,125 @@ class Sam3PropagateThread(QThread):
             )
             cast_module_16bit(predictor.model, SAM3_DTYPE)
             _apply_vram_safe(predictor)
+            try:
+                if hasattr(predictor.model, "masklet_confirmation_enable"):
+                    predictor.model.masklet_confirmation_enable = False
+            except Exception:
+                pass
 
-            inference_state = predictor.model.init_state(
-                resource_path=clip, offload_video_to_cpu=True,
-                async_loading_frames=False)
-            session_id = str(uuid.uuid4())
-            predictor._all_inference_states[session_id] = {
-                "state": inference_state, "session_id": session_id,
-                "start_time": time.time(), "last_use_time": time.time()}
-
-            # Box + class-text combo prompt: box-only par tracker aage ke
-            # frames output nahi karta (measured), box+text par karta hai.
-            prompt_kwargs = dict(frame_index=0, bounding_boxes=box_xywh_rel,
-                                 bounding_box_labels=[1])
-            if self.class_name:
-                prompt_kwargs["text"] = self.class_name
-            predictor.handle_request(dict(type="add_prompt", session_id=session_id,
-                                          **prompt_kwargs))
-            total = len(names)
-            stream = predictor.handle_stream_request(dict(
-                type="propagate_in_video", session_id=session_id,
-                propagation_direction="forward",
-                max_frame_num_to_track=total))
-            # Phase 1: collect best tracked box per frame (single object).
-            tracked = {}  # fi -> (cx, cy, w, h)
+            passes = []
+            if self.direction in ("forward", "both"):
+                passes.append(("forward", cur - lo, hi - cur + 1))
+            if self.direction in ("backward", "both"):
+                passes.append(("backward", cur - lo, cur - lo + 1))
+            total_steps = max(1, sum(p[2] for p in passes) * max(1, len(self.items)))
             done = 0
-            for resp in stream:
-                fi = resp["frame_index"]
-                if fi < 0 or fi >= total:
-                    continue
-                out = resp["outputs"]
-                ids = np.asarray(out.get("out_obj_ids", []))
-                probs = np.asarray(out.get("out_probs", np.zeros(len(ids))))
-                rboxes = np.asarray(out.get("out_boxes_xywh", np.zeros((len(ids), 4))))
-                best, best_p = None, -1.0
-                for j in range(len(ids)):
-                    p = float(probs[j]) if j < len(probs) else 0.0
-                    if j >= len(rboxes) or p < self.score_thres:
-                        continue
-                    x, y, w_, h_ = [float(v) for v in rboxes[j].tolist()]
-                    if w_ <= 0 or h_ <= 0:
-                        continue
-                    if p > best_p:
-                        best, best_p = (x + w_ / 2, y + h_ / 2, w_, h_), p
-                if best is not None:
-                    tracked[fi] = best
-                done += 1
-                self.progress.emit(int(done / total * 100))
-                if done % 10 == 0:
-                    torch.cuda.empty_cache()
 
-            # Phase 2: interpolate interior gaps (CVAT-style) so every frame
-            # between first and last tracked frame gets a box.
-            interp = 0
-            if tracked:
-                lo, hi = min(tracked), max(tracked)
-                fis = sorted(tracked)
-                for a, b in zip(fis, fis[1:]):
-                    if b - a <= 1:
-                        continue
-                    ba = tracked[a]
-                    bb = tracked[b]
-                    for fi in range(a + 1, b):
-                        t = (fi - a) / (b - a)
-                        tracked[fi] = tuple(ba[k] + (bb[k] - ba[k]) * t for k in range(4))
-                        interp += 1
+            # per-frame merged tracks: gfi -> list of (cls_id, cx, cy, w, h)
+            per_frame = {}
 
-            # Phase 3: write one tracked box per frame (dedup same-class overlaps).
-            for fi in sorted(tracked):
-                name = names[fi]
+            def open_session():
+                st = predictor.model.init_state(
+                    resource_path=clip, offload_video_to_cpu=True,
+                    async_loading_frames=False)
+                sid = str(uuid.uuid4())
+                predictor._all_inference_states[sid] = {
+                    "state": st, "session_id": sid,
+                    "start_time": time.time(), "last_use_time": time.time()}
+                return sid
+
+            def close_session(sid):
+                try:
+                    predictor.handle_request(dict(type="close_session", session_id=sid))
+                except Exception:
+                    pass
+                import gc as _gc
+                _gc.collect()
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+            for box_parts, _cls_name in self.items:
+                cls_id = int(float(box_parts[0]))
+                xc, yc, bw, bh = map(float, box_parts[1:5])
+                box_xywh_rel = [[xc - bw / 2, yc - bh / 2, bw, bh]]
+                for direction, start_fi, max_n in passes:
+                    sid = open_session()
+                    try:
+                        # box-only prompt (measured: text breaks box tracking)
+                        predictor.handle_request(dict(
+                            type="add_prompt", session_id=sid, frame_index=start_fi,
+                            bounding_boxes=box_xywh_rel, bounding_box_labels=[1]))
+                        stream = predictor.handle_stream_request(dict(
+                            type="propagate_in_video", session_id=sid,
+                            propagation_direction=direction,
+                            start_frame_index=start_fi,
+                            max_frame_num_to_track=max_n))
+                        tracked = {}  # clip fi -> (cx, cy, w, h)
+                        for resp in stream:
+                            fi = resp["frame_index"]
+                            if fi < 0 or fi >= len(names):
+                                continue
+                            out = resp["outputs"]
+                            ids = np.asarray(out.get("out_obj_ids", []))
+                            probs = np.asarray(out.get("out_probs", np.zeros(len(ids))))
+                            rboxes = np.asarray(out.get("out_boxes_xywh", np.zeros((len(ids), 4))))
+                            best, best_p = None, -1.0
+                            for j in range(len(ids)):
+                                p = float(probs[j]) if j < len(probs) else 0.0
+                                if j >= len(rboxes) or p < self.score_thres:
+                                    continue
+                                x, y, w_, h_ = [float(v) for v in rboxes[j].tolist()]
+                                if w_ <= 0 or h_ <= 0:
+                                    continue
+                                if p > best_p:
+                                    best, best_p = (x + w_ / 2, y + h_ / 2, w_, h_), p
+                            if best is not None:
+                                tracked[fi] = best
+                            done += 1
+                            self.progress.emit(int(done / total_steps * 100))
+                            if done % 10 == 0:
+                                torch.cuda.empty_cache()
+                        # interpolate interior gaps for this box+pass
+                        if tracked:
+                            fis = sorted(tracked)
+                            for a, b in zip(fis, fis[1:]):
+                                if b - a <= 1:
+                                    continue
+                                ba, bb = tracked[a], tracked[b]
+                                for fi in range(a + 1, b):
+                                    t = (fi - a) / (b - a)
+                                    tracked[fi] = tuple(ba[k] + (bb[k] - ba[k]) * t for k in range(4))
+                        for fi, box in tracked.items():
+                            gfi = (lo - 1) + fi
+                            per_frame.setdefault(gfi, []).append((cls_id, box))
+                    finally:
+                        close_session(sid)
+
+            # write merged boxes (dedup same-class overlaps per frame)
+            for gfi in sorted(per_frame):
+                name = self.images[gfi]
                 label_path, original_lines = self._read_labels(name)
                 exist = [ln.strip().split() for ln in original_lines if ln.strip()]
-                cx, cy, w_, h_ = tracked[fi]
-                x1, y1, x2, y2 = cx - w_ / 2, cy - h_ / 2, cx + w_ / 2, cy + h_ / 2
-                kept = []
-                for p in exist:
-                    try:
-                        if int(float(p[0])) == cls_id:
-                            px, py, pw, ph = map(float, p[1:5])
-                            pa = [px - pw / 2, py - ph / 2, px + pw / 2, py + ph / 2]
-                            if _iou_xyxy([x1, y1, x2, y2], pa) > 0.3:
-                                continue
-                    except Exception:
-                        pass
-                    kept.append(p)
-                kept.append([str(cls_id), f"{cx:.6f}", f"{cy:.6f}",
-                             f"{w_:.6f}", f"{h_:.6f}"])
-                new_lines = [" ".join(x) + "\n" for x in kept]
+                for cls_id, (cx, cy, w_, h_) in per_frame[gfi]:
+                    x1, y1, x2, y2 = cx - w_ / 2, cy - h_ / 2, cx + w_ / 2, cy + h_ / 2
+                    kept = []
+                    for p in exist:
+                        try:
+                            if int(float(p[0])) == cls_id:
+                                px, py, pw, ph = map(float, p[1:5])
+                                pa = [px - pw / 2, py - ph / 2, px + pw / 2, py + ph / 2]
+                                if _iou_xyxy([x1, y1, x2, y2], pa) > 0.3:
+                                    continue
+                        except Exception:
+                            pass
+                        kept.append(p)
+                    kept.append([str(cls_id), f"{cx:.6f}", f"{cy:.6f}",
+                                 f"{w_:.6f}", f"{h_:.6f}"])
+                    exist = kept
+                new_lines = [" ".join(x) + "\n" for x in exist]
                 if new_lines != original_lines:
                     files_snapshot[label_path] = original_lines
                     with open(label_path, "w", encoding="utf-8") as f:
@@ -408,8 +454,9 @@ class Sam3PropagateThread(QThread):
                     updated += 1
 
             self.snapshot.emit(files_snapshot)
-            self.finished.emit(updated, f"SAM3 tracked 1 object across {updated} files "
-                                       f"({interp} interpolated).")
+            n_obj = len(self.items)
+            self.finished.emit(updated, f"SAM3 tracked {n_obj} object(s) across {updated} files "
+                                       f"({self.direction}).")
         except Exception as e:
             self.error.emit(f"SAM3 track error: {e}\n{traceback.format_exc()}")
         finally:
