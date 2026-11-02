@@ -874,7 +874,8 @@ class AnnotationApp(QWidget):
             self.list_sam3_classes.addItems([f"{i}:{n}" for i, n in enumerate(self.classes)])
 
     def refresh_models(self):
-        self.models = scan_models()
+        self.models = [m for m in scan_models()
+                       if not m.lower().startswith("sam3")]
         self.combo_models.clear()
         if self.models:
             self.combo_models.addItems(self.models)
