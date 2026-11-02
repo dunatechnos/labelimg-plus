@@ -246,8 +246,14 @@ class Sam3PropagateThread(QThread):
     snapshot = pyqtSignal(dict)
 
     def __init__(self, images, images_dir, labels_dir, start_idx, end_idx,
-                 box_parts, score_thres=0.35):
-        """box_parts: [cls, xc, yc, w, h] strings (normalized, from start image)."""
+                 box_parts, score_thres=0.15):
+        """box_parts: [cls, xc, yc, w, h] strings (normalized, from start image).
+
+        score_thres intentionally low (0.15): tracker confidence fluctuates
+        frame to frame; gaps are filled by interpolation below instead of
+        dropping boxes (annotator deletes false positives faster than
+        drawing missing boxes).
+        """
         super().__init__()
         self.images = images
         self.images_dir = images_dir
@@ -321,6 +327,8 @@ class Sam3PropagateThread(QThread):
                 type="propagate_in_video", session_id=session_id,
                 propagation_direction="forward",
                 max_frame_num_to_track=total))
+            # Phase 1: collect best tracked box per frame (single object).
+            tracked = {}  # fi -> (cx, cy, w, h)
             done = 0
             for resp in stream:
                 fi = resp["frame_index"]
@@ -330,49 +338,69 @@ class Sam3PropagateThread(QThread):
                 ids = np.asarray(out.get("out_obj_ids", []))
                 probs = np.asarray(out.get("out_probs", np.zeros(len(ids))))
                 rboxes = np.asarray(out.get("out_boxes_xywh", np.zeros((len(ids), 4))))
-                name = names[fi]
-                label_path, original_lines = self._read_labels(name)
-                exist = [ln.strip().split() for ln in original_lines if ln.strip()]
-                changed = False
+                best, best_p = None, -1.0
                 for j in range(len(ids)):
-                    if j < len(probs) and float(probs[j]) < self.score_thres:
-                        continue
-                    if j >= len(rboxes):
+                    p = float(probs[j]) if j < len(probs) else 0.0
+                    if j >= len(rboxes) or p < self.score_thres:
                         continue
                     x, y, w_, h_ = [float(v) for v in rboxes[j].tolist()]
                     if w_ <= 0 or h_ <= 0:
                         continue
-                    x1, y1, x2, y2 = x, y, x + w_, y + h_
-                    # dedup: drop same-class boxes overlapping the tracked box
-                    kept = []
-                    for p in exist:
-                        try:
-                            if int(float(p[0])) == cls_id:
-                                px, py, pw, ph = map(float, p[1:5])
-                                pa = [px - pw / 2, py - ph / 2, px + pw / 2, py + ph / 2]
-                                if _iou_xyxy([x1, y1, x2, y2], pa) > 0.3:
-                                    changed = True
-                                    continue
-                        except Exception:
-                            pass
-                        kept.append(p)
-                    kept.append([str(cls_id), f"{(x1 + x2) / 2:.6f}",
-                                 f"{(y1 + y2) / 2:.6f}", f"{x2 - x1:.6f}", f"{y2 - y1:.6f}"])
-                    exist = kept
-                    changed = True
-                new_lines = [" ".join(x) + "\n" for x in exist]
-                if changed and new_lines != original_lines:
-                    files_snapshot[label_path] = original_lines
-                    with open(label_path, "w", encoding="utf-8") as f:
-                        f.writelines(new_lines)
-                    updated += 1
+                    if p > best_p:
+                        best, best_p = (x + w_ / 2, y + h_ / 2, w_, h_), p
+                if best is not None:
+                    tracked[fi] = best
                 done += 1
                 self.progress.emit(int(done / total * 100))
                 if done % 10 == 0:
                     torch.cuda.empty_cache()
 
+            # Phase 2: interpolate interior gaps (CVAT-style) so every frame
+            # between first and last tracked frame gets a box.
+            interp = 0
+            if tracked:
+                lo, hi = min(tracked), max(tracked)
+                fis = sorted(tracked)
+                for a, b in zip(fis, fis[1:]):
+                    if b - a <= 1:
+                        continue
+                    ba = tracked[a]
+                    bb = tracked[b]
+                    for fi in range(a + 1, b):
+                        t = (fi - a) / (b - a)
+                        tracked[fi] = tuple(ba[k] + (bb[k] - ba[k]) * t for k in range(4))
+                        interp += 1
+
+            # Phase 3: write one tracked box per frame (dedup same-class overlaps).
+            for fi in sorted(tracked):
+                name = names[fi]
+                label_path, original_lines = self._read_labels(name)
+                exist = [ln.strip().split() for ln in original_lines if ln.strip()]
+                cx, cy, w_, h_ = tracked[fi]
+                x1, y1, x2, y2 = cx - w_ / 2, cy - h_ / 2, cx + w_ / 2, cy + h_ / 2
+                kept = []
+                for p in exist:
+                    try:
+                        if int(float(p[0])) == cls_id:
+                            px, py, pw, ph = map(float, p[1:5])
+                            pa = [px - pw / 2, py - ph / 2, px + pw / 2, py + ph / 2]
+                            if _iou_xyxy([x1, y1, x2, y2], pa) > 0.3:
+                                continue
+                    except Exception:
+                        pass
+                    kept.append(p)
+                kept.append([str(cls_id), f"{cx:.6f}", f"{cy:.6f}",
+                             f"{w_:.6f}", f"{h_:.6f}"])
+                new_lines = [" ".join(x) + "\n" for x in kept]
+                if new_lines != original_lines:
+                    files_snapshot[label_path] = original_lines
+                    with open(label_path, "w", encoding="utf-8") as f:
+                        f.writelines(new_lines)
+                    updated += 1
+
             self.snapshot.emit(files_snapshot)
-            self.finished.emit(updated, f"SAM3 tracked 1 object across {updated} files.")
+            self.finished.emit(updated, f"SAM3 tracked 1 object across {updated} files "
+                                       f"({interp} interpolated).")
         except Exception as e:
             self.error.emit(f"SAM3 track error: {e}\n{traceback.format_exc()}")
         finally:
