@@ -54,6 +54,12 @@ from libs.create_ml_io import CreateMLReader
 from libs.create_ml_io import JSON_EXT
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
+try:
+    from annotation_helper.vehicle_window_working2 import MainWindow as VehicleWindow
+except ImportError:
+    # Optional module; file not in repo (only stale .pyc). Vehicle Window
+    # menu action will show a message instead of crashing startup.
+    VehicleWindow = None
 
 __appname__ = 'labelImg'
 
@@ -437,6 +443,11 @@ class MainWindow(QMainWindow, WindowMixin):
         self.menuBar().insertAction(self.menus.edit.menuAction(), actHelperBack)
         # --- END Annotation Helper button ---
 
+        actVehicle = QAction("Vehicle Window", self)
+        actVehicle.triggered.connect(self.launch_vehicle_window)
+        self.menuBar().addAction(actVehicle)
+
+    
         # Auto saving : Enable auto saving if pressing next
         self.auto_saving = QAction(get_str('autoSaveMode'), self)
         self.auto_saving.setCheckable(True)
@@ -756,6 +767,40 @@ class MainWindow(QMainWindow, WindowMixin):
 
         except:
             pass
+
+    # -----------vehicle_window----------------
+
+    def launch_vehicle_window(self):
+        if VehicleWindow is None:
+            QMessageBox.warning(self, "Vehicle Window",
+                                "vehicle_window module is not available in this checkout.")
+            return
+        try:
+
+            images_dir = self.default_save_dir
+            batch_folder = os.path.dirname(images_dir)
+
+            images_dir = os.path.join(batch_folder, "images")
+            labels_dir = os.path.join(batch_folder, "labels")
+
+            os.makedirs(images_dir, exist_ok=True)
+            os.makedirs(labels_dir, exist_ok=True)
+
+            # Inject paths into vehicle_window module
+            try:
+                import annotation_helper.vehicle_window_working2 as vw
+                vw.IMAGES_DIR = images_dir
+                vw.LABELS_DIR = labels_dir
+
+            except:
+                pass
+
+            win = VehicleWindow()
+            win.show()
+
+        except Exception as e:
+            print("Vehicle Window Error:", e)
+
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Control:
