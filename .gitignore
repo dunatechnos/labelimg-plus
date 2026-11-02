@@ -45,3 +45,7 @@ tmp.*
 *.pt
 *_work_*p.mp4
 sam3track_*/
+# Helper runtime folders when launched from repo root (user data, never commit)
+/labels/
+/images/
+prod_*/

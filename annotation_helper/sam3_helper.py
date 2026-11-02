@@ -314,7 +314,8 @@ class Sam3PropagateThread(QThread):
 
             predictor.handle_request(dict(type="add_prompt", session_id=session_id,
                                           frame_index=0,
-                                          bounding_boxes=box_xywh_rel))
+                                          bounding_boxes=box_xywh_rel,
+                                          bounding_box_labels=[1]))
             total = len(names)
             stream = predictor.handle_stream_request(dict(
                 type="propagate_in_video", session_id=session_id,
