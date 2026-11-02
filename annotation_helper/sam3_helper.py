@@ -246,9 +246,13 @@ class Sam3PropagateThread(QThread):
     snapshot = pyqtSignal(dict)
 
     def __init__(self, images, images_dir, labels_dir, start_idx, end_idx,
-                 box_parts, score_thres=0.15):
+                 box_parts, class_name=None, score_thres=0.15):
         """box_parts: [cls, xc, yc, w, h] strings (normalized, from start image).
 
+        class_name: box ke class ka naam (classes.txt se). Ye text prompt ke
+        roop me box ke SAATH bheja jata hai — box-only prompt par tracker
+        aage ke frames me object ko output hi nahi karta (measured), jabki
+        box+text par poori tarah track hota hai.
         score_thres intentionally low (0.15): tracker confidence fluctuates
         frame to frame; gaps are filled by interpolation below instead of
         dropping boxes (annotator deletes false positives faster than
@@ -261,6 +265,7 @@ class Sam3PropagateThread(QThread):
         self.start_idx = start_idx
         self.end_idx = end_idx
         self.box_parts = box_parts
+        self.class_name = class_name
         self.score_thres = score_thres
 
     def _read_labels(self, name):
@@ -318,10 +323,14 @@ class Sam3PropagateThread(QThread):
                 "state": inference_state, "session_id": session_id,
                 "start_time": time.time(), "last_use_time": time.time()}
 
+            # Box + class-text combo prompt: box-only par tracker aage ke
+            # frames output nahi karta (measured), box+text par karta hai.
+            prompt_kwargs = dict(frame_index=0, bounding_boxes=box_xywh_rel,
+                                 bounding_box_labels=[1])
+            if self.class_name:
+                prompt_kwargs["text"] = self.class_name
             predictor.handle_request(dict(type="add_prompt", session_id=session_id,
-                                          frame_index=0,
-                                          bounding_boxes=box_xywh_rel,
-                                          bounding_box_labels=[1]))
+                                          **prompt_kwargs))
             total = len(names)
             stream = predictor.handle_stream_request(dict(
                 type="propagate_in_video", session_id=session_id,

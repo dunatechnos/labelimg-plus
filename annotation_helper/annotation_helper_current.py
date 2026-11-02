@@ -1412,8 +1412,11 @@ class AnnotationApp(QWidget):
             self.label_status.setText(f"SAM3 unavailable (run in sam3 env with GPU): {e}")
             return
         images = list_images()
+        cls_id = int(float(selected[0][0]))
+        cls_name = self.classes[cls_id] if cls_id < len(self.classes) else None
         self.sam3_thread = Sam3PropagateThread(
-            images, IMAGES_DIR, LABELS_DIR, start_idx, end_idx, selected[0])
+            images, IMAGES_DIR, LABELS_DIR, start_idx, end_idx, selected[0],
+            class_name=cls_name)
         self.sam3_thread.progress.connect(self.on_predict_progress)
         self.sam3_thread.finished.connect(self.on_predict_finished)
         self.sam3_thread.error.connect(self.on_predict_error)
