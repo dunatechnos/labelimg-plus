@@ -15,6 +15,8 @@ import time
 import shutil
 import tempfile
 import traceback
+import urllib.request
+import urllib.error
 import numpy as np
 from functools import partial
 from collections import deque
@@ -64,6 +66,77 @@ UNDO_MAX = 20  # max undo stack depth
 HELPER_DIR = os.path.dirname(os.path.abspath(__file__))
 SAM2_CHECKPOINT = os.path.join(HELPER_DIR, "sam2_models", "sam2.1_hiera_small.pt")
 SAM2_CONFIG_FILE = "configs/sam2.1/sam2.1_hiera_s.yaml"
+# Official Meta checkpoint (~180 MB). Downloaded automatically on first use,
+# so end users never need to copy any .pt file manually.
+SAM2_CHECKPOINT_URL = (
+    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/"
+    "sam2.1_hiera_small.pt"
+)
+SAM2_CHECKPOINT_MIN_BYTES = 100 * 1024 * 1024  # sanity check for partial downloads
+
+
+def sam2_checkpoint_available():
+    """True if the SAM 2 checkpoint exists and looks complete."""
+    try:
+        return (
+            os.path.exists(SAM2_CHECKPOINT)
+            and os.path.getsize(SAM2_CHECKPOINT) >= SAM2_CHECKPOINT_MIN_BYTES
+        )
+    except OSError:
+        return False
+
+
+def download_sam2_checkpoint(progress_cb=None):
+    """Download the SAM 2 checkpoint to SAM2_CHECKPOINT.
+
+    progress_cb(downloaded_bytes, total_bytes) is called as chunks arrive.
+    Writes to a .part file first, then moves atomically into place.
+    Raises RuntimeError on failure. Returns the checkpoint path.
+    """
+    os.makedirs(os.path.dirname(SAM2_CHECKPOINT), exist_ok=True)
+    tmp_path = SAM2_CHECKPOINT + ".part"
+    req = urllib.request.Request(
+        SAM2_CHECKPOINT_URL, headers={"User-Agent": "labelimg-plus"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = resp.getheader("Content-Length")
+            total = int(total) if total else 0
+            downloaded = 0
+            with open(tmp_path, "wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(downloaded, total)
+                        except Exception:
+                            pass
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            "Could not download the SAM 2 model (~180 MB).\n"
+            "Check your internet connection and retry.\n"
+            f"URL: {SAM2_CHECKPOINT_URL}\nDetails: {e}"
+        )
+    if os.path.getsize(tmp_path) < SAM2_CHECKPOINT_MIN_BYTES:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            "SAM 2 model download looks incomplete "
+            "(file too small). Please retry."
+        )
+    os.replace(tmp_path, SAM2_CHECKPOINT)
+    return SAM2_CHECKPOINT
 
 # Create folders if not exist
 os.makedirs(IMAGES_DIR, exist_ok=True)
@@ -386,6 +459,42 @@ class PredictThread(QThread):
             tb = traceback.format_exc()
             self.error.emit(f"Predict thread error: {e}\n{tb}")
 
+# ---------------- SAM 2 Model Download Worker (QThread) ----------------
+class Sam2DownloadThread(QThread):
+    progress = pyqtSignal(int)          # percent
+    status = pyqtSignal(str)
+    done = pyqtSignal(str)              # checkpoint path
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            if sam2_checkpoint_available():
+                self.progress.emit(100)
+                self.done.emit(SAM2_CHECKPOINT)
+                return
+
+            def _cb(downloaded, total):
+                if total > 0:
+                    pct = int(downloaded * 100 / total)
+                    self.progress.emit(max(0, min(99, pct)))
+                    mb_done = downloaded / (1024 * 1024)
+                    mb_total = total / (1024 * 1024)
+                    self.status.emit(
+                        f"Downloading SAM 2 model... {mb_done:.0f}/{mb_total:.0f} MB"
+                    )
+                else:
+                    self.status.emit(
+                        f"Downloading SAM 2 model... {downloaded / (1024 * 1024):.0f} MB"
+                    )
+
+            self.status.emit("Downloading SAM 2 model (~180 MB, first use only)...")
+            path = download_sam2_checkpoint(progress_cb=_cb)
+            self.progress.emit(100)
+            self.done.emit(path)
+        except Exception as e:
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
 # ---------------- SAM 2 Tracking Worker (QThread) ----------------
 class Sam2TrackThread(QThread):
     progress = pyqtSignal(int)
@@ -415,13 +524,41 @@ class Sam2TrackThread(QThread):
         skipped_detections = 0
         seen_frames = set()
         try:
-            import torch
-            from sam2.build_sam import build_sam2_video_predictor
+            try:
+                import torch
+            except ImportError:
+                raise RuntimeError(
+                    "PyTorch is not installed.\n"
+                    "Install it from https://pytorch.org/get-started/locally/ "
+                    "then retry."
+                )
+            try:
+                from sam2.build_sam import build_sam2_video_predictor
+            except ImportError:
+                raise RuntimeError(
+                    "The 'sam2' package is not installed.\n"
+                    "Install it with:\n"
+                    "  pip install hydra-core iopath\n"
+                    "  $env:SAM2_BUILD_CUDA=\"0\"\n"
+                    "  pip install -e <sam2-repo> --no-deps  (or pip install sam2)\n"
+                    "then retry."
+                )
 
             if not self.images:
                 raise RuntimeError("No frames found.")
-            if not os.path.exists(self.checkpoint):
-                raise RuntimeError("SAM 2 checkpoint not found:\n" + self.checkpoint)
+            # First use: fetch the checkpoint automatically so the user
+            # never has to copy any .pt file manually.
+            if not sam2_checkpoint_available():
+                self.status.emit("SAM 2 model not found. Downloading (~180 MB)...")
+                self.progress.emit(1)
+
+                def _dl_cb(downloaded, total):
+                    if total > 0:
+                        self.progress.emit(max(1, min(4, int(downloaded * 4 / total))))
+
+                download_sam2_checkpoint(progress_cb=_dl_cb)
+                self.status.emit("SAM 2 model downloaded.")
+                self.progress.emit(4)
 
             n = len(self.images)
             start = max(0, min(int(self.start_index) - 1, n - 1))
@@ -717,6 +854,7 @@ class AnnotationApp(QWidget):
         # UI build
         self.build_ui()
         self.on_action_changed("delete")
+        self.update_sam2_model_label()
 
         # keyboard shortcuts
         self.setup_shortcuts()
@@ -884,6 +1022,25 @@ class AnnotationApp(QWidget):
         self.sam2_status.setObjectName("statusLabel")
         self.sam2_status.setWordWrap(True)
         sam2_opt_v.addWidget(self.sam2_status)
+
+        # SAM 2 model row: status + one-click download (~180 MB, first use only)
+        sam2_model_row = QHBoxLayout()
+        sam2_model_row.setSpacing(6)
+        self.sam2_model_status = QLabel()
+        self.sam2_model_status.setObjectName("statusLabel")
+        self.sam2_model_status.setWordWrap(True)
+        sam2_model_row.addWidget(self.sam2_model_status, 1)
+        self.btn_sam2_download = QPushButton("Download model")
+        self.btn_sam2_download.setObjectName("secondaryButton")
+        self.btn_sam2_download.setToolTip(
+            "Download the SAM 2 tracking model (~180 MB, one time). "
+            "It is fetched automatically when tracking starts."
+        )
+        self.btn_sam2_download.clicked.connect(self.on_sam2_download_clicked)
+        sam2_model_row.addWidget(self.btn_sam2_download)
+        sam2_opt_v.addLayout(sam2_model_row)
+        self.sam2_download_thread = None
+        self._sam2_autostart_after_download = False
 
         self.sam2_options.setVisible(False)
         prop_v.addWidget(self.sam2_options)
@@ -1813,9 +1970,25 @@ class AnnotationApp(QWidget):
             self.sam2_status.setText("Select one or more boxes on the current frame first.")
             self.label_status.setText("SAM 2: no boxes selected.")
             return
-        if not os.path.exists(SAM2_CHECKPOINT):
-            self.sam2_status.setText("SAM 2 checkpoint missing:\n" + SAM2_CHECKPOINT)
-            self.label_status.setText("SAM 2 checkpoint missing. See the propagation panel.")
+        # First use: model (~180 MB) is fetched automatically. Ask once,
+        # then download in the background and auto-start tracking.
+        if not sam2_checkpoint_available():
+            answer = QMessageBox.question(
+                self,
+                "Download SAM 2 model?",
+                "The SAM 2 tracking model (~180 MB) is not downloaded yet.\n"
+                "Download it now from the official Meta release?\n"
+                "(One-time download, then tracking starts automatically.)",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                self.sam2_status.setText(
+                    "SAM 2 model download skipped. Tracking needs the model."
+                )
+                return
+            self._sam2_autostart_after_download = True
+            self.start_sam2_model_download()
             return
 
         images = list_images()
@@ -1880,6 +2053,7 @@ class AnnotationApp(QWidget):
             self.radio_prop_sam2,
             self.combo_sam2_direction,
             self.spin_sam2_conf,
+            self.btn_sam2_download,
         ):
             widget.setEnabled(enabled)
         self.update_apply_button_text()
@@ -1898,6 +2072,77 @@ class AnnotationApp(QWidget):
         self.load_image(self.current_index)
         self.sam2_status.setText("SAM 2 tracking failed. Partial label changes can be undone.")
         self.label_status.setText("SAM 2 tracking failed. See console for traceback.")
+        print(message)
+
+    # --------------- SAM 2 model download ---------------
+    def update_sam2_model_label(self):
+        """Show whether the SAM 2 model is ready or needs downloading."""
+        try:
+            if sam2_checkpoint_available():
+                size_mb = os.path.getsize(SAM2_CHECKPOINT) / (1024 * 1024)
+                self.sam2_model_status.setText(
+                    f"SAM 2 model: ready ({size_mb:.0f} MB)"
+                )
+                self.btn_sam2_download.setVisible(False)
+            else:
+                self.sam2_model_status.setText(
+                    "SAM 2 model: not downloaded (~180 MB, auto-downloads)"
+                )
+                self.btn_sam2_download.setVisible(True)
+        except Exception:
+            pass
+
+    def on_sam2_download_clicked(self):
+        self._sam2_autostart_after_download = False
+        self.start_sam2_model_download()
+
+    def start_sam2_model_download(self):
+        if self.sam2_download_thread is not None and self.sam2_download_thread.isRunning():
+            self.sam2_status.setText("SAM 2 model is already downloading...")
+            return
+        if sam2_checkpoint_available():
+            self.update_sam2_model_label()
+            self.sam2_status.setText("SAM 2 model is already downloaded.")
+            if self._sam2_autostart_after_download:
+                self._sam2_autostart_after_download = False
+                self.start_sam2_tracking()
+            return
+        self.sam2_download_thread = Sam2DownloadThread()
+        self.sam2_download_thread.progress.connect(self.on_sam2_download_progress)
+        self.sam2_download_thread.status.connect(self.on_sam2_download_status)
+        self.sam2_download_thread.done.connect(self.on_sam2_download_done)
+        self.sam2_download_thread.failed.connect(self.on_sam2_download_failed)
+        self.set_action_controls_enabled(False)
+        self.progress_bar.setValue(0)
+        self.sam2_download_thread.start()
+
+    def on_sam2_download_progress(self, value):
+        self.progress_bar.setValue(int(value))
+
+    def on_sam2_download_status(self, message):
+        self.sam2_status.setText(message)
+        self.label_status.setText(message)
+
+    def on_sam2_download_done(self, path):
+        self.progress_bar.setValue(100)
+        self.set_action_controls_enabled(True)
+        self.update_sam2_model_label()
+        self.sam2_status.setText("SAM 2 model ready.")
+        self.label_status.setText("SAM 2 model downloaded.")
+        # User pressed Apply Action: start tracking automatically now.
+        if self._sam2_autostart_after_download:
+            self._sam2_autostart_after_download = False
+            self.start_sam2_tracking()
+
+    def on_sam2_download_failed(self, message):
+        self.progress_bar.setValue(0)
+        self.set_action_controls_enabled(True)
+        self._sam2_autostart_after_download = False
+        self.update_sam2_model_label()
+        self.sam2_status.setText(
+            "SAM 2 model download failed. Check internet and retry."
+        )
+        self.label_status.setText("SAM 2 model download failed.")
         print(message)
 
     # --------------- Predict action ---------------

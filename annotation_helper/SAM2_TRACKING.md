@@ -75,6 +75,12 @@ Normalized to the original frame size (6 decimal places).
 - Dependencies added: `hydra-core`, `iopath`
 - Checkpoint:
   `annotation_helper/sam2_models/sam2.1_hiera_small.pt`
+  (~176 MB, official Meta release:
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt)
+- **First use: the checkpoint downloads automatically** (one-time, ~176 MB)
+  when tracking starts, or via the **Download model** button in the
+  Dynamic SAM 2 panel. It is git-ignored, so end users never need to
+  copy any `.pt` file manually.
 - Model config:
   `configs/sam2.1/sam2.1_hiera_s.yaml`
 - Frames are mirrored to a temporary numeric-name folder while tracking
@@ -90,7 +96,8 @@ $env:SAM2_BUILD_CUDA="0"
 pip install -e C:\Users\kesha\Downloads\Sam2\sam2 --no-deps
 ```
 
-Then make sure the checkpoint exists at the path above.
+Then make sure the `sam2` package is installed (see above). The checkpoint
+itself downloads automatically on first use — no manual step needed.
 
 ## Notes
 
