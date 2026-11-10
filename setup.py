@@ -8,9 +8,9 @@ import sys
 import os
 
 here = os.path.abspath(os.path.dirname(__file__))
-NAME = 'labelImg'
-REQUIRES_PYTHON = '>=3.0.0'
-REQUIRED_DEP = ['pyqt5', 'lxml']
+NAME = 'labelimg-plus'
+REQUIRES_PYTHON = '>=3.8'
+REQUIRED_DEP = ['pyqt5', 'lxml', 'Pillow', 'PyYAML', 'opencv-python', 'ultralytics', 'hydra-core', 'iopath', 'numpy']
 about = {}
 
 with open(os.path.join(here, 'libs', '__init__.py')) as f:
@@ -85,17 +85,19 @@ setup(
     app=APP,
     name=NAME,
     version=about['__version__'],
-    description="LabelImg is a graphical image annotation tool and label object bounding boxes in images",
+    description="LabelImg Plus is a graphical image annotation tool with YOLO prediction and SAM2 video tracking",
     long_description=readme + '\n\n' + history,
     author="TzuTa Lin",
     author_email='tzu.ta.lin@gmail.com',
-    url='https://github.com/tzutalin/labelImg',
+    maintainer="Duna Keshav Rao",
+    url='https://github.com/dunatechnos/labelimg-plus',
     python_requires=REQUIRES_PYTHON,
     package_dir={'labelImg': '.'},
     packages=required_packages,
     entry_points={
         'console_scripts': [
-            'labelImg=labelImg.labelImg:main'
+            'labelImg=labelImg.labelImg:main',
+            'labelimg-plus=labelImg.labelImg:main'
         ]
     },
     include_package_data=True,

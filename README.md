@@ -30,7 +30,7 @@ It helps with:
 * running prediction on full images
 * running prediction only inside a selected area
 
-![Annotation Helper Window](assets/annotation-helper-ui.png)
+![Annotation Helper Window](assets/annotation_helper-ui.png)
 
 ## ⚠️ Current Format Support
 
@@ -113,7 +113,7 @@ python labelImg.py images classes.txt
 
 ### Annotation Helper Window
 
-![Annotation Helper Window.](assets/annotation_helper.gif)
+![Annotation Helper Window](assets/annotation_helper-ui.png)
 
 ---
 
@@ -212,7 +212,10 @@ If many labels have the same class in the same image range, Select Area Mode hel
 
 ### Screenshot
 
-![Delete action](assets/delete_action.gif)
+
+```md
+![Delete - Select Area Mode](assets/delete.gif)
+```
 
 ---
 
@@ -243,8 +246,9 @@ The selected label is copied across the entered range.
 ### Screenshot
 
 
+```md
 ![Propagate](assets/propogate.gif)
-
+```
 
 ---
 
@@ -294,7 +298,10 @@ If multiple objects share the same class, this allows changing only the intended
 
 ### Screenshot
 
-![Change Class ](assets/classchange.gif)
+
+```md
+![Change Class - Select Area Mode](assets/classchange.gif)
+```
 
 ---
 
@@ -339,73 +346,6 @@ Use this when you want to run prediction only inside a selected region.
 
 Prediction is applied only inside the selected area.
 
-## 🔄 LabelImg Plus Workflow
-
-```mermaid
-flowchart TD
-
-    A[Open Dataset] --> B[Launch LabelImg Plus]
-
-    B --> C{Choose Workflow}
-
-    C --> D[Manual Annotation]
-    C --> E[Annotation Helper]
-
-    D --> D1[Create Bounding Box]
-    D1 --> D2[Assign Class]
-    D2 --> D3[Save Annotation]
-
-    E --> F[Select Image Range<br/>Index → End]
-
-    F --> G{Choose Action}
-
-    G --> H[Delete]
-    G --> I[Propagate]
-    G --> J[Change Class]
-    G --> K[Prediction]
-
-    H --> H1{Delete Mode}
-    H1 --> H2[Delete Class]
-    H1 --> H3[Delete Specific Label]
-    H3 --> H4[Enable Select Area Mode]
-
-    I --> I1[Select Label]
-    I1 --> I2[Propagate Across Range]
-
-    J --> J1{Change Mode}
-    J1 --> J2[Change Entire Class]
-    J1 --> J3[Change Specific Object]
-    J3 --> J4[Enable Select Area Mode]
-
-    K --> K1{Prediction Type}
-    K1 --> K2[Normal Prediction]
-    K1 --> K3[Crop Prediction]
-
-    K2 --> K4[Select Model]
-    K3 --> K5[Enable Select Area Mode]
-    K5 --> K4
-
-    K4 --> K6[Run Prediction]
-
-    H2 --> L[Apply Action]
-    H4 --> L
-    I2 --> L
-    J2 --> L
-    J4 --> L
-    K6 --> L
-
-    L --> M[Review Result]
-
-    M --> N{Need Undo?}
-
-    N -->|Yes| O[Undo]
-    O --> M
-
-    N -->|No| P[Save Annotations]
-
-    P --> Q[Finished]
-```
-
 ### Why this is useful
 
 This is helpful when:
@@ -441,63 +381,6 @@ This makes it especially useful for large datasets and repetitive annotation wor
 
 ---
 
-## 🚀 Roadmap
-
-LabelImg Plus is actively being developed. The following features are planned for future releases.
-
-### Version 1.x (Current)
-- [x] Annotation Helper
-- [x] Delete Class / Delete Specific Label
-- [x] Label Propagation
-- [x] Change Class
-- [x] Normal Prediction
-- [x] Crop Prediction
-- [x] Select Area Mode
-- [x] Multiple YOLO Model Support
-- [x] Undo System
-
----
-
-### Version 2.0 (Planned)
-
-#### 📦 Multi-Format Annotation Support
-Currently LabelImg Plus supports YOLO format only.
-
-Future versions will add support for:
-- [ ] Pascal VOC (.xml)
-- [ ] CreateML (.json)
-
-This will allow users to work with multiple annotation formats without converting datasets manually.
-
----
-
-#### 🔍 FiftyOne Integration
-Planned integration with Voxel51 FiftyOne.
-
-Features may include:
-- [ ] Open datasets directly in FiftyOne
-- [ ] Visual dataset inspection
-- [ ] Annotation quality review
-- [ ] Model prediction analysis
-- [ ] Dataset filtering and search
-- [ ] Error detection and dataset cleanup
-
----
-
-### Future Vision
-
-LabelImg Plus aims to become a complete annotation platform by combining:
-
-- Manual Annotation
-- Smart Annotation Helper
-- AI-Assisted Labeling
-- Multi-Format Support
-- FiftyOne Dataset Management
-- Advanced Dataset Review Tools
-
-All within a single workflow.
-
----
 ## 👨‍💻 Authors & Credits
 
 ### LabelImg Plus (Enhanced Version)

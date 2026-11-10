@@ -12,7 +12,10 @@ import re
 import sys
 import cv2
 import time
+import shutil
+import tempfile
 import traceback
+import numpy as np
 from functools import partial
 from collections import deque
 
@@ -22,7 +25,8 @@ from PyQt5.QtWidgets import (
     QSpinBox, QComboBox, QCheckBox, QListWidget, QListWidgetItem,
     QLineEdit, QFileDialog, QMessageBox, QShortcut, QDialog,
     QDialogButtonBox, QFormLayout, QTableWidget, QTableWidgetItem,
-    QProgressBar, QRadioButton, QGroupBox, QScrollArea, QFrame
+    QProgressBar, QRadioButton, QGroupBox, QScrollArea, QFrame,
+    QGraphicsDropShadowEffect
 )
 
 from PyQt5.QtGui import QImage, QPixmap, QPen, QColor, QKeySequence, QFont
@@ -55,6 +59,11 @@ LABELS_DIR = "labels"
 CLASSES_FILE = os.path.join(LABELS_DIR, "classes.txt")
 MODELS_DIR = "models"
 UNDO_MAX = 20  # max undo stack depth
+
+# ---- SAM 2 video tracking ----
+HELPER_DIR = os.path.dirname(os.path.abspath(__file__))
+SAM2_CHECKPOINT = os.path.join(HELPER_DIR, "sam2_models", "sam2.1_hiera_small.pt")
+SAM2_CONFIG_FILE = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
 # Create folders if not exist
 os.makedirs(IMAGES_DIR, exist_ok=True)
@@ -103,6 +112,107 @@ def scan_models():
     files = sorted(files, key=natural_key)
     return files
 
+
+# ---------------- SAM 2 label helpers ----------------
+def read_label_lines(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.readlines()
+    return []
+
+
+def write_label_lines(path, lines):
+    with open(path, "w", encoding="utf-8") as f:
+        for parts in lines:
+            f.write(" ".join(map(str, parts)) + "\n")
+
+
+def mask_to_yolo_label(mask, cls, width, height):
+    """Convert a binary SAM 2 mask to a YOLO [cls xc yc w h] line."""
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    x1 = max(0, min(width - 1, int(xs.min())))
+    x2 = max(0, min(width - 1, int(xs.max())))
+    y1 = max(0, min(height - 1, int(ys.min())))
+    y2 = max(0, min(height - 1, int(ys.max())))
+    bw = (x2 - x1) / float(width)
+    bh = (y2 - y1) / float(height)
+    if bw <= 0 or bh <= 0:
+        return None
+    xc = (x1 + x2) / 2.0 / float(width)
+    yc = (y1 + y2) / 2.0 / float(height)
+    return [str(cls), f"{xc:.6f}", f"{yc:.6f}", f"{bw:.6f}", f"{bh:.6f}"]
+
+
+def yolo_iou(a, b):
+    """IoU for two YOLO label lines (normalized xc yc w h)."""
+    ax1 = float(a[1]) - float(a[3]) / 2.0
+    ax2 = float(a[1]) + float(a[3]) / 2.0
+    ay1 = float(a[2]) - float(a[4]) / 2.0
+    ay2 = float(a[2]) + float(a[4]) / 2.0
+    bx1 = float(b[1]) - float(b[3]) / 2.0
+    bx2 = float(b[1]) + float(b[3]) / 2.0
+    by1 = float(b[2]) - float(b[4]) / 2.0
+    by2 = float(b[2]) + float(b[4]) / 2.0
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def merge_tracked_labels(original_raw_lines, tracked_labels, iou_thresh=0.5):
+    """
+    Replace same-class existing boxes that overlap a tracked box by > iou_thresh.
+    All other existing labels (other classes, non-overlapping same class) are kept.
+    """
+    original = []
+    for raw in original_raw_lines:
+        parts = raw.strip().split()
+        if parts:
+            original.append(parts)
+
+    tracked_meta = []
+    for parts in tracked_labels:
+        try:
+            tracked_meta.append((
+                int(float(parts[0])),
+                float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]),
+            ))
+        except (TypeError, ValueError):
+            continue
+
+    final = []
+    for parts in original:
+        if len(parts) < 5:
+            final.append(parts)
+            continue
+        try:
+            cls = int(float(parts[0]))
+            xc, yc, bw, bh = map(float, parts[1:5])
+        except (TypeError, ValueError):
+            final.append(parts)
+            continue
+
+        remove = False
+        for tcls, txc, tyc, tw, th in tracked_meta:
+            if cls != tcls:
+                continue
+            if yolo_iou(parts, [str(tcls), txc, tyc, tw, th]) > iou_thresh:
+                remove = True
+                break
+        if not remove:
+            final.append(parts)
+
+    final.extend([list(x) for x in tracked_labels])
+    changed = final != original
+    return final, changed
+
+
 # ---------------- QGraphics Box Item ----------------
 class BBoxItem(QGraphicsRectItem):
     def __init__(self, rect: QRectF, parts):
@@ -131,6 +241,45 @@ class PredictThread(QThread):
         self.model = model_obj
         self.start_idx = start_idx
         self.end_idx = end_idx
+
+        # Build a name -> index map from classes.txt (our current class list)
+        self.our_classes = read_classes()
+        self.name_to_idx = {n.strip().lower(): i for i, n in enumerate(self.our_classes)}
+
+        # Model's own index -> name map (from the loaded YOLO model)
+        raw_names = getattr(self.model, "names", {}) or {}
+        # ultralytics sometimes gives a dict {0:'name',...}, sometimes a list ['name',...]
+        if isinstance(raw_names, dict):
+            self.model_names = raw_names
+        elif isinstance(raw_names, (list, tuple)):
+            self.model_names = {i: n for i, n in enumerate(raw_names)}
+        else:
+            self.model_names = {}
+
+        print("DEBUG our_classes:", self.our_classes)
+        print("DEBUG model_names:", self.model_names)
+
+        # track any predicted class names that couldn't be matched to classes.txt
+        self.unmatched_names = set()
+
+    def remap_cls(self, model_cls_idx):
+        """
+        Convert a class index coming from the model's own prediction
+        (model_cls_idx, based on the model's training order) into the
+        index used in our classes.txt, by matching on the class NAME.
+        Falls back to the original index if the name isn't found
+        (and records it in self.unmatched_names for a warning).
+        """
+        model_name = self.model_names.get(model_cls_idx, None)
+        if model_name is None:
+            # model has no name info for this index, keep as-is
+            return model_cls_idx
+        mapped = self.name_to_idx.get(str(model_name).strip().lower())
+        if mapped is None:
+            self.unmatched_names.add(model_name)
+            return model_cls_idx  # fallback: keep original index
+        print(f"DEBUG remap: model_idx={model_cls_idx} name={model_name} -> our_idx={mapped}")
+        return mapped
 
     def run(self):
         updated = 0
@@ -192,7 +341,7 @@ class PredictThread(QThread):
 
                     # parse predictions (tensor -> list)
                     for b in results[0].boxes:
-                        cls = int(b.cls[0])
+                        cls = self.remap_cls(int(b.cls[0]))
                         x1, y1, x2, y2 = b.xyxy[0].tolist()   # safe conversion
                         # shift to original image coords (pixel)
                         x1 = x1 + xmin_px
@@ -208,7 +357,7 @@ class PredictThread(QThread):
                 else:
                     results = self.model(img)
                     for b in results[0].boxes:
-                        cls = int(b.cls[0])
+                        cls = self.remap_cls(int(b.cls[0]))
                         x1, y1, x2, y2 = b.xyxy[0].tolist()
                         xc = (x1 + x2) / 2 / w
                         yc = (y1 + y2) / 2 / h
@@ -229,10 +378,258 @@ class PredictThread(QThread):
 
             # Emit snapshot for undo (main thread)
             self.snapshot.emit(files_snapshot)
-            self.finished.emit(updated, f"Prediction done for {updated} files")
+            msg = f"Prediction done for {updated} files"
+            if self.unmatched_names:
+                msg += f" | WARNING: {len(self.unmatched_names)} class name(s) from model not found in classes.txt: {', '.join(sorted(self.unmatched_names))} (used model's original index for these)"
+            self.finished.emit(updated, msg)
         except Exception as e:
             tb = traceback.format_exc()
             self.error.emit(f"Predict thread error: {e}\n{tb}")
+
+# ---------------- SAM 2 Tracking Worker (QThread) ----------------
+class Sam2TrackThread(QThread):
+    progress = pyqtSignal(int)
+    status = pyqtSignal(str)
+    snapshot = pyqtSignal(dict)
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, images, start_index, direction, boxes, images_dir, labels_dir, checkpoint, min_confidence=0.5):
+        super().__init__()
+        self.images = list(images)
+        self.start_index = int(start_index)
+        self.direction = direction
+        self.boxes = [list(parts) for parts in boxes]
+        self.images_dir = images_dir
+        self.labels_dir = labels_dir
+        self.checkpoint = checkpoint
+        self.min_confidence = max(0.0, min(1.0, float(min_confidence)))
+
+    def run(self):
+        tmp_dir = None
+        predictor = None
+        state = None
+        files_snapshot = {}
+        snapshot_sent = False
+        updated_files = 0
+        skipped_detections = 0
+        seen_frames = set()
+        try:
+            import torch
+            from sam2.build_sam import build_sam2_video_predictor
+
+            if not self.images:
+                raise RuntimeError("No frames found.")
+            if not os.path.exists(self.checkpoint):
+                raise RuntimeError("SAM 2 checkpoint not found:\n" + self.checkpoint)
+
+            n = len(self.images)
+            start = max(0, min(int(self.start_index) - 1, n - 1))
+            direction = self.direction
+
+            if direction == "forward":
+                total = n - start
+            elif direction == "backward":
+                total = start + 1
+            else:
+                total = n
+            total = max(1, total)
+
+            valid_boxes = []
+            for parts in self.boxes:
+                if len(parts) < 5:
+                    continue
+                try:
+                    cls = str(int(float(parts[0])))
+                    xc, yc, bw, bh = map(float, parts[1:5])
+                except (TypeError, ValueError):
+                    continue
+                valid_boxes.append((cls, xc, yc, bw, bh))
+            if not valid_boxes:
+                raise RuntimeError("No valid selected YOLO boxes.")
+
+            # SAM 2's folder loader only accepts integer frame names, so mirror the
+            # folder into a temporary 000000.jpg sequence in the same order as the UI.
+            self.status.emit("Preparing frames for SAM 2...")
+            tmp_dir = tempfile.mkdtemp(prefix=".sam2_track_", dir=self.images_dir)
+            for i, name in enumerate(self.images):
+                src = os.path.join(self.images_dir, name)
+                dst = os.path.join(tmp_dir, f"{i:06d}.jpg")
+                ext = os.path.splitext(src)[1].lower()
+                if ext in (".jpg", ".jpeg"):
+                    try:
+                        os.link(src, dst)
+                    except OSError:
+                        shutil.copy2(src, dst)
+                else:
+                    img = cv2.imread(src)
+                    if img is None:
+                        raise RuntimeError("Cannot read frame: " + name)
+                    cv2.imwrite(dst, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if i % 15 == 0:
+                    self.status.emit(f"Preparing frames {i + 1}/{n}...")
+                    self.progress.emit(max(1, int(3 * (i + 1) / n)))
+
+            self.status.emit("Loading SAM 2 model...")
+            self.progress.emit(4)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            predictor = build_sam2_video_predictor(
+                SAM2_CONFIG_FILE,
+                self.checkpoint,
+                device=device,
+                apply_postprocessing=True,
+            )
+
+            self.status.emit("Loading video frames...")
+            self.progress.emit(5)
+            state = predictor.init_state(
+                tmp_dir,
+                offload_video_to_cpu=True,
+                offload_state_to_cpu=True,
+                async_loading_frames=False,
+            )
+            width = int(state["video_width"])
+            height = int(state["video_height"])
+
+            obj_classes = {}
+            for idx, (cls, xc, yc, bw, bh) in enumerate(valid_boxes):
+                obj_id = idx + 1
+                x1 = (xc - bw / 2.0) * width
+                y1 = (yc - bh / 2.0) * height
+                x2 = (xc + bw / 2.0) * width
+                y2 = (yc + bh / 2.0) * height
+                x1 = max(0.0, min(width - 1.0, x1))
+                y1 = max(0.0, min(height - 1.0, y1))
+                x2 = max(x1 + 1.0, min(float(width), x2))
+                y2 = max(y1 + 1.0, min(float(height), y2))
+                predictor.add_new_points_or_box(
+                    state,
+                    frame_idx=start,
+                    obj_id=obj_id,
+                    box=[x1, y1, x2, y2],
+                )
+                obj_classes[obj_id] = cls
+
+            def process_frame(frame_idx, obj_ids, video_res_masks):
+                nonlocal updated_files, skipped_detections
+                frame_idx = int(frame_idx)
+                if frame_idx in seen_frames:
+                    return
+                seen_frames.add(frame_idx)
+
+                tracked_labels = []
+                for mask_idx, obj_id in enumerate(obj_ids):
+                    cls = obj_classes.get(int(obj_id))
+                    if cls is None:
+                        continue
+
+                    # SAM 2's object-presence score for this frame/object.
+                    score = None
+                    try:
+                        obj_idx = state["obj_id_to_idx"].get(int(obj_id))
+                        if obj_idx is not None:
+                            obj_out = state["output_dict_per_obj"].get(obj_idx, {})
+                            out = (
+                                obj_out.get("cond_frame_outputs", {}).get(frame_idx)
+                                or obj_out.get("non_cond_frame_outputs", {}).get(frame_idx)
+                            )
+                            if out is not None:
+                                score_logits = out.get("object_score_logits")
+                                if score_logits is not None:
+                                    score = float(
+                                        score_logits.float().sigmoid().mean().item()
+                                    )
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        score = None
+
+                    if score is not None and score < self.min_confidence:
+                        skipped_detections += 1
+                        continue
+
+                    mask = (video_res_masks[mask_idx, 0] > 0.0).cpu().numpy()
+                    label = mask_to_yolo_label(mask, cls, width, height)
+                    if label is not None:
+                        tracked_labels.append(label)
+
+                if tracked_labels and 0 <= frame_idx < len(self.images):
+                    name = self.images[frame_idx]
+                    label_file = os.path.join(
+                        self.labels_dir, os.path.splitext(name)[0] + ".txt"
+                    )
+                    original_lines = read_label_lines(label_file)
+                    merged, changed = merge_tracked_labels(original_lines, tracked_labels)
+                    if changed:
+                        if label_file not in files_snapshot:
+                            files_snapshot[label_file] = original_lines
+                        write_label_lines(label_file, merged)
+                        updated_files += 1
+
+                pct = int(6 + 93 * len(seen_frames) / total)
+                self.progress.emit(min(99, max(6, pct)))
+                self.status.emit(
+                    f"Tracking {len(seen_frames)}/{total} frames  ·  "
+                    f"{len(obj_classes)} object(s)  ·  "
+                    f"skipped {skipped_detections} low-confidence"
+                )
+
+            if direction in ("forward", "entire"):
+                for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(
+                    state,
+                    start_frame_idx=start,
+                    max_frame_num_to_track=n - 1 - start,
+                ):
+                    process_frame(frame_idx, obj_ids, video_res_masks)
+
+            if direction in ("backward", "entire"):
+                if start > 0:
+                    for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(
+                        state,
+                        start_frame_idx=start,
+                        max_frame_num_to_track=start,
+                        reverse=True,
+                    ):
+                        process_frame(frame_idx, obj_ids, video_res_masks)
+                elif direction == "backward":
+                    # Reverse tracking yields nothing at frame 0; process the prompt frame once.
+                    for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(
+                        state,
+                        start_frame_idx=0,
+                        max_frame_num_to_track=0,
+                    ):
+                        process_frame(frame_idx, obj_ids, video_res_masks)
+
+            if files_snapshot:
+                snapshot_sent = True
+                self.snapshot.emit(files_snapshot)
+            self.progress.emit(100)
+            self.status.emit("SAM 2 tracking finished.")
+            self.done.emit(
+                f"SAM 2 tracked {len(obj_classes)} object(s) across "
+                f"{len(seen_frames)} frame(s); updated {updated_files} label file(s); "
+                f"skipped {skipped_detections} low-confidence detection(s)."
+            )
+        except Exception as e:
+            if files_snapshot and not snapshot_sent:
+                self.snapshot.emit(files_snapshot)
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+        finally:
+            try:
+                del state
+            except Exception:
+                pass
+            try:
+                del predictor
+            except Exception:
+                pass
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 # ---------------- Select Images Dialog (for propagate) ----------------
 class ChooseImagesDialog(QDialog):
@@ -300,6 +697,7 @@ class AnnotationApp(QWidget):
         self.active_model_path = None
         self.active_model = None
         self.custom_target_indices = None    # <-- ADD THIS HERE
+        self.sam2_thread = None
 
 
         self.current_index = 1 if self.images else 0
@@ -318,6 +716,7 @@ class AnnotationApp(QWidget):
 
         # UI build
         self.build_ui()
+        self.on_action_changed("delete")
 
         # keyboard shortcuts
         self.setup_shortcuts()
@@ -329,28 +728,37 @@ class AnnotationApp(QWidget):
     def build_ui(self):
         # root layout
         root = QHBoxLayout(self)
-        root.setContentsMargins(8,8,8,8)
-        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(16)
 
-        # Left modern panel (controls) - use a scroll area so if many controls they remain accessible
-        left_panel_width = 360
+        # ===================== LEFT PANEL (modern card) =====================
+        left_panel_width = 380
         left_frame = QFrame()
         left_frame.setObjectName("leftPanel")
         left_frame.setFixedWidth(left_panel_width)
         left_layout = QVBoxLayout(left_frame)
-        left_layout.setContentsMargins(10,10,10,10)
-        left_layout.setSpacing(12)
+        left_layout.setContentsMargins(18, 18, 18, 18)
+        left_layout.setSpacing(14)
 
-        # Title / App name
+        # soft drop-shadow for the card
+        shadow = QGraphicsDropShadowEffect(left_frame)
+        shadow.setBlurRadius(30)
+        shadow.setXOffset(0)
+        shadow.setYOffset(6)
+        shadow.setColor(QColor(31, 41, 55, 40))
+        left_frame.setGraphicsEffect(shadow)
+
+        # --- Header / brand ---
         title = QLabel("Annotation Helper")
         title.setObjectName("titleLabel")
-        title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
         left_layout.addWidget(title)
 
         # --- Navigation Group ---
-        nav_label = QLabel("Image Navigation")
-        nav_label.setProperty("section", True)
-        left_layout.addWidget(nav_label)
+        nav_group = QGroupBox("Navigation")
+        nav_group.setObjectName("cardGroup")
+        nav_v = QVBoxLayout(nav_group)
+        nav_v.setSpacing(8)
 
         nav_row = QHBoxLayout()
         nav_row.setSpacing(8)
@@ -359,33 +767,43 @@ class AnnotationApp(QWidget):
         self.spin_index.setMaximum(max(1, len(self.images))); self.spin_index.setValue(self.current_index or 1)
         nav_row.addWidget(self.spin_index)
         btn_load = QPushButton("Load")
+        btn_load.setObjectName("secondaryButton")
         btn_load.clicked.connect(self.on_load_clicked)
         nav_row.addWidget(btn_load)
-        left_layout.addLayout(nav_row)
+        nav_v.addLayout(nav_row)
 
         end_row = QHBoxLayout()
         end_row.addWidget(QLabel("End:"))
         self.spin_end = QSpinBox(); self.spin_end.setMinimum(1)
         self.spin_end.setMaximum(max(1, len(self.images))); self.spin_end.setValue(len(self.images) or 1)
         end_row.addWidget(self.spin_end)
-        left_layout.addLayout(end_row)
+        nav_v.addLayout(end_row)
 
         # Select area mode
         self.chk_area_mode = QCheckBox("Select Area Mode")
-        left_layout.addWidget(self.chk_area_mode)
+        nav_v.addWidget(self.chk_area_mode)
+
+        left_layout.addWidget(nav_group)
 
         # --- Actions Group ---
-        act_label = QLabel("Actions")
-        act_label.setProperty("section", True)
-        left_layout.addWidget(act_label)
-
-        # --- RADIO BUTTON ACTION SECTION (REPLACEMENT FOR DROPDOWN) ---
-        action_row = QVBoxLayout()
+        act_group = QGroupBox("Actions")
+        act_group.setObjectName("cardGroup")
+        action_row = QVBoxLayout(act_group)
         action_row.setSpacing(8)
+
+        # --- RADIO BUTTON ACTION SECTION (segmented style) ---
+        radio_wrap = QFrame()
+        radio_wrap.setObjectName("segmentWrap")
+        radio_h = QHBoxLayout(radio_wrap)
+        radio_h.setContentsMargins(4, 4, 4, 4)
+        radio_h.setSpacing(4)
 
         self.radio_delete = QRadioButton("Delete")
         self.radio_propagate = QRadioButton("Propagate")
         self.radio_change = QRadioButton("Change Class")
+        for r in (self.radio_delete, self.radio_propagate, self.radio_change):
+            r.setObjectName("segmentRadio")
+            r.setFont(QFont("Segoe UI", 8))
 
         # Default selection (same as old dropdown)
         self.radio_delete.setChecked(True)
@@ -395,86 +813,182 @@ class AnnotationApp(QWidget):
         self.radio_propagate.toggled.connect(lambda checked: checked and self.on_action_changed("propagate"))
         self.radio_change.toggled.connect(lambda checked: checked and self.on_action_changed("change"))
 
-        action_row.addWidget(self.radio_delete)
-        action_row.addWidget(self.radio_propagate)
-        action_row.addWidget(self.radio_change)
+        radio_h.addWidget(self.radio_delete)
+        radio_h.addWidget(self.radio_propagate)
+        radio_h.addWidget(self.radio_change)
 
-        left_layout.addLayout(action_row)
+        action_row.addWidget(radio_wrap)
 
-        # Old class dropdown (for change)
-        line_old = QHBoxLayout()
+        # Propagation options (visible only when Propagate is selected)
+        self.propagation_options = QFrame()
+        prop_v = QVBoxLayout(self.propagation_options)
+        prop_v.setContentsMargins(0, 2, 0, 2)
+        prop_v.setSpacing(8)
+
+        prop_mode_wrap = QFrame()
+        prop_mode_wrap.setObjectName("segmentWrap")
+        prop_mode_h = QHBoxLayout(prop_mode_wrap)
+        prop_mode_h.setContentsMargins(4, 4, 4, 4)
+        prop_mode_h.setSpacing(4)
+
+        self.radio_prop_static = QRadioButton("Static Propagation")
+        self.radio_prop_sam2 = QRadioButton("Dynamic SAM 2")
+        for r in (self.radio_prop_static, self.radio_prop_sam2):
+            r.setObjectName("segmentRadio")
+            r.setFont(QFont("Segoe UI", 8))
+        self.radio_prop_static.setChecked(True)
+        self.radio_prop_static.toggled.connect(
+            lambda checked: checked and self.on_propagation_mode_changed()
+        )
+        self.radio_prop_sam2.toggled.connect(
+            lambda checked: checked and self.on_propagation_mode_changed()
+        )
+        prop_mode_h.addWidget(self.radio_prop_static)
+        prop_mode_h.addWidget(self.radio_prop_sam2)
+        prop_v.addWidget(prop_mode_wrap)
+
+        self.sam2_options = QFrame()
+        sam2_opt_v = QVBoxLayout(self.sam2_options)
+        sam2_opt_v.setContentsMargins(0, 0, 0, 0)
+        sam2_opt_v.setSpacing(6)
+
+        self.sam2_selected = QLabel("Selected boxes: 0")
+        self.sam2_selected.setObjectName("statusLabel")
+        sam2_opt_v.addWidget(self.sam2_selected)
+
+        sam2_dir_row = QHBoxLayout()
+        sam2_dir_row.addWidget(QLabel("SAM 2 Direction:"))
+        self.combo_sam2_direction = QComboBox()
+        self.combo_sam2_direction.addItems(["Backward", "Forward", "Entire video"])
+        self.combo_sam2_direction.setCurrentIndex(2)
+        sam2_dir_row.addWidget(self.combo_sam2_direction)
+        sam2_opt_v.addLayout(sam2_dir_row)
+
+        conf_row = QHBoxLayout()
+        conf_row.addWidget(QLabel("Min confidence:"))
+        self.spin_sam2_conf = QSpinBox()
+        self.spin_sam2_conf.setRange(0, 100)
+        self.spin_sam2_conf.setValue(50)
+        self.spin_sam2_conf.setSingleStep(5)
+        self.spin_sam2_conf.setSuffix("%")
+        self.spin_sam2_conf.setToolTip(
+            "SAM 2 object-presence score threshold. Lower-confidence detections "
+            "are not written to YOLO labels. 0% disables filtering."
+        )
+        conf_row.addWidget(self.spin_sam2_conf)
+        sam2_opt_v.addLayout(conf_row)
+
+        self.sam2_status = QLabel(
+            "Select boxes on the current frame, then Apply Action."
+        )
+        self.sam2_status.setObjectName("statusLabel")
+        self.sam2_status.setWordWrap(True)
+        sam2_opt_v.addWidget(self.sam2_status)
+
+        self.sam2_options.setVisible(False)
+        prop_v.addWidget(self.sam2_options)
+        self.propagation_options.setVisible(False)
+        action_row.addWidget(self.propagation_options)
+
+        # Old class dropdown (for delete/change)
+        self.old_class_row = QFrame()
+        line_old = QHBoxLayout(self.old_class_row)
+        line_old.setContentsMargins(0, 0, 0, 0)
         self.combo_old_class = QComboBox()
         self.refresh_full_class_list()
         line_old.addWidget(QLabel("Old Class:"))
         line_old.addWidget(self.combo_old_class)
-        action_row.addLayout(line_old)
+        action_row.addWidget(self.old_class_row)
 
-        # Area classes dropdown (conditional)
-        line_area_class = QHBoxLayout()
+        # Area classes dropdown (conditional, change only)
+        self.area_class_row = QFrame()
+        line_area_class = QHBoxLayout(self.area_class_row)
+        line_area_class.setContentsMargins(0, 0, 0, 0)
         self.combo_area_class = QComboBox()
         self.combo_area_class.setVisible(False)
         line_area_class.addWidget(QLabel("Area Class:"))
         line_area_class.addWidget(self.combo_area_class)
-        action_row.addLayout(line_area_class)
+        self.area_class_row.setVisible(False)
+        action_row.addWidget(self.area_class_row)
 
         # New class (for change target)
-        line_new = QHBoxLayout()
+        self.new_class_row = QFrame()
+        line_new = QHBoxLayout(self.new_class_row)
+        line_new.setContentsMargins(0, 0, 0, 0)
         self.combo_new_class = QComboBox()
         self.refresh_full_class_list()
         line_new.addWidget(QLabel("New Class:"))
         line_new.addWidget(self.combo_new_class)
-        action_row.addLayout(line_new)
+        self.new_class_row.setVisible(False)
+        action_row.addWidget(self.new_class_row)
 
         # Apply button centered
         self.btn_apply = QPushButton("Apply Action")
+        self.btn_apply.setObjectName("primaryButton")
+        self.btn_apply.setCursor(Qt.PointingHandCursor)
         self.btn_apply.clicked.connect(self.on_apply_action)
         action_row.addWidget(self.btn_apply)
 
-        left_layout.addLayout(action_row)
+        left_layout.addWidget(act_group)
 
-        
         # --- Model / Predict Panel ---
-        model_label = QLabel("Model & Predict")
-        model_label.setProperty("section", True)
-        left_layout.addWidget(model_label)
+        model_group = QGroupBox("Model & Predict")
+        model_group.setObjectName("cardGroup")
+        model_v = QVBoxLayout(model_group)
+        model_v.setSpacing(8)
 
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("Model:"))
         self.combo_models = QComboBox()
         self.refresh_models()
         model_row.addWidget(self.combo_models)
-        left_layout.addLayout(model_row)
+        model_v.addLayout(model_row)
 
         reload_row = QHBoxLayout()
         btn_reload_models = QPushButton("Reload Models")
+        btn_reload_models.setObjectName("secondaryButton")
         btn_reload_models.clicked.connect(self.on_reload_models)
         reload_row.addWidget(btn_reload_models)
-        left_layout.addLayout(reload_row)
+        model_v.addLayout(reload_row)
 
         pred_row = QHBoxLayout()
         self.btn_predict = QPushButton("Predict")
+        self.btn_predict.setObjectName("primaryButton")
+        self.btn_predict.setCursor(Qt.PointingHandCursor)
         self.btn_predict.clicked.connect(self.on_predict_clicked)
         pred_row.addWidget(self.btn_predict)
+        model_v.addLayout(pred_row)
+
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumHeight(18)
-        pred_row.addWidget(self.progress_bar)
-        left_layout.addLayout(pred_row)
+        self.progress_bar.setMaximumHeight(16)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        model_v.addWidget(self.progress_bar)
+
+        left_layout.addWidget(model_group)
 
         # --- Selected boxes list (kept small) ---
-        sel_label = QLabel("Selected boxes")
-        sel_label.setProperty("section", True)
-        left_layout.addWidget(sel_label)
+        sel_group = QGroupBox("Selected Boxes")
+        sel_group.setObjectName("cardGroup")
+        sel_v = QVBoxLayout(sel_group)
 
         self.list_selected = QListWidget()
-        self.list_selected.setFixedHeight(140)
-        left_layout.addWidget(self.list_selected)
+        self.list_selected.setFixedHeight(130)
+        sel_v.addWidget(self.list_selected)
+
+        left_layout.addWidget(sel_group)
 
         # Image path and copy
         path_row = QHBoxLayout()
+        path_row.setSpacing(6)
         self.line_img_path = QLineEdit()
         self.line_img_path.setReadOnly(True)
+        self.line_img_path.setPlaceholderText("Image path...")
         path_row.addWidget(self.line_img_path)
-        btn_copy = QPushButton("Copy Path")
+        btn_copy = QPushButton("Copy")
+        btn_copy.setObjectName("iconButton")
+        btn_copy.setToolTip("Copy image path")
+        btn_copy.setFixedWidth(56)
         btn_copy.clicked.connect(self.copy_image_path)
         path_row.addWidget(btn_copy)
         left_layout.addLayout(path_row)
@@ -482,16 +996,21 @@ class AnnotationApp(QWidget):
         # Undo / Status
         left_layout.addStretch()
         bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(8)
         self.btn_undo = QPushButton("Undo")
+        self.btn_undo.setObjectName("dangerButton")
         self.btn_undo.setEnabled(False)
         self.btn_undo.clicked.connect(self.perform_undo)
         bottom_row.addWidget(self.btn_undo)
         self.label_status = QLabel("Ready")
-        bottom_row.addWidget(self.label_status)
+        self.label_status.setObjectName("statusLabel")
+        self.label_status.setWordWrap(True)
+        bottom_row.addWidget(self.label_status, 1)
         left_layout.addLayout(bottom_row)
 
         # Put left frame inside a scroll area for better UX on smaller screens
         left_scroll = QScrollArea()
+        left_scroll.setObjectName("leftScroll")
         left_scroll.setWidgetResizable(True)
         left_scroll.setWidget(left_frame)
         left_scroll.setFixedWidth(left_panel_width + 8)
@@ -501,26 +1020,188 @@ class AnnotationApp(QWidget):
         self.scene = QGraphicsScene()
         self.scene.selectionChanged.connect(self.on_scene_selection_changed)
         self.view = QGraphicsView(self.scene)
+        self.view.setObjectName("imageView")
         self.view.setDragMode(QGraphicsView.NoDrag)
+        self.view.setRenderHints(self.view.renderHints())
         self.view.viewport().installEventFilter(self)
 
         # style the view to show a subtle background
-        self.view.setBackgroundBrush(QColor(240,240,240))
+        self.view.setBackgroundBrush(QColor(233, 236, 242))
+
+        # wrap the view in a card frame for a consistent modern look
+        view_frame = QFrame()
+        view_frame.setObjectName("viewCard")
+        view_layout = QVBoxLayout(view_frame)
+        view_layout.setContentsMargins(0, 0, 0, 0)
+        view_layout.addWidget(self.view)
+        view_shadow = QGraphicsDropShadowEffect(view_frame)
+        view_shadow.setBlurRadius(30)
+        view_shadow.setXOffset(0)
+        view_shadow.setYOffset(6)
+        view_shadow.setColor(QColor(31, 41, 55, 35))
+        view_frame.setGraphicsEffect(view_shadow)
 
         # add widgets to root
         root.addWidget(left_scroll, 0)
-        root.addWidget(self.view, 1)
+        root.addWidget(view_frame, 1)
 
-        # Style sheet for modern look
+        # ===================== Modern Style Sheet =====================
         self.setStyleSheet("""
-            QWidget { background: #f5f7fb; font-family: "Segoe UI"; }
-            #leftPanel { background: white; border-radius: 12px; border: 1px solid #e3e6ea; }
-            QLabel[section="true"] { font-weight: 600; color: #333; margin-top: 6px; margin-bottom: 2px; }
-            QPushButton { padding: 6px 10px; border-radius: 8px; }
-            QPushButton:pressed { padding-left: 7px; padding-top: 7px; }
-            QLineEdit, QComboBox, QSpinBox, QListWidget { border: 1px solid #e1e4e8; border-radius: 6px; padding: 4px; background: white; }
-            QProgressBar { border: 1px solid #d4d8dd; border-radius: 6px; background: #eee; height: 14px; }
-            #titleLabel { color: #1976d2; }
+            QWidget {
+                background: #eef1f7;
+                font-family: "Segoe UI";
+                color: #1f2937;
+                font-size: 10.5pt;
+            }
+            QScrollArea#leftScroll, QScrollArea#leftScroll > QWidget > QWidget {
+                background: transparent;
+                border: none;
+            }
+            #leftPanel {
+                background: #ffffff;
+                border-radius: 16px;
+                border: 1px solid #e6e9f0;
+            }
+            #logoBadge {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #6366f1, stop:1 #8b5cf6);
+                border-radius: 10px;
+                font-size: 16pt;
+            }
+            #titleLabel { color: #111827; }
+            #subtitleLabel { color: #9ca3af; }
+
+            QGroupBox#cardGroup {
+                background: #f9fafc;
+                border: 1px solid #e9ecf3;
+                border-radius: 12px;
+                margin-top: 10px;
+                padding: 12px 10px 10px 10px;
+                font-weight: 600;
+                color: #374151;
+            }
+            QGroupBox#cardGroup::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+                color: #4b5563;
+            }
+
+            QLabel { color: #374151; }
+
+            #segmentWrap {
+                background: #eef0f6;
+                border-radius: 10px;
+            }
+            QRadioButton#segmentRadio {
+                padding: 6px 4px;
+                border-radius: 8px;
+            }
+            QRadioButton#segmentRadio::indicator {
+                width: 0px;
+                height: 0px;
+            }
+            QRadioButton#segmentRadio:checked {
+                background: #ffffff;
+                color: #4f46e5;
+                font-weight: 600;
+            }
+
+            QPushButton {
+                padding: 7px 12px;
+                border-radius: 8px;
+                background: #ffffff;
+                border: 1px solid #d7dbe4;
+                color: #374151;
+            }
+            QPushButton:hover { background: #f3f4f8; }
+            QPushButton:pressed { padding-left: 8px; padding-top: 8px; }
+
+            QPushButton#primaryButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #6366f1, stop:1 #7c3aed);
+                color: white;
+                border: none;
+                font-weight: 600;
+                padding: 9px 12px;
+            }
+            QPushButton#primaryButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #5457e5, stop:1 #6d28d9);
+            }
+            QPushButton#secondaryButton {
+                background: #f3f4f8;
+                border: 1px solid #dfe2ea;
+                color: #4b5563;
+            }
+            QPushButton#dangerButton {
+                background: #fff1f2;
+                border: 1px solid #fecdd3;
+                color: #e11d48;
+                font-weight: 600;
+            }
+            QPushButton#dangerButton:hover { background: #ffe4e6; }
+            QPushButton#dangerButton:disabled {
+                background: #f3f4f6; color: #9ca3af; border: 1px solid #e5e7eb;
+            }
+            QPushButton#iconButton {
+                background: #f3f4f8;
+                border: 1px solid #dfe2ea;
+            }
+
+            QLineEdit, QComboBox, QSpinBox, QListWidget {
+                border: 1px solid #dfe2ea;
+                border-radius: 8px;
+                padding: 5px 8px;
+                background: white;
+                selection-background-color: #c7d2fe;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+                border: 1px solid #818cf8;
+            }
+            QListWidget { padding: 4px; }
+            QListWidget::item { border-radius: 6px; padding: 3px; }
+            QListWidget::item:selected { background: #eef0ff; color: #4338ca; }
+
+            QCheckBox { spacing: 8px; }
+
+            QProgressBar {
+                border: none;
+                border-radius: 7px;
+                background: #e7e9f0;
+                height: 14px;
+            }
+            QProgressBar::chunk {
+                border-radius: 7px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #6366f1, stop:1 #a855f7);
+            }
+
+            #statusLabel { color: #6b7280; font-size: 9.5pt; }
+
+            #viewCard {
+                background: #ffffff;
+                border-radius: 16px;
+                border: 1px solid #e6e9f0;
+            }
+            QGraphicsView#imageView {
+                border: none;
+                border-radius: 16px;
+                background: #e9ecf2;
+            }
+
+            QScrollBar:vertical {
+                background: transparent;
+                width: 10px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: #cbd0dc;
+                border-radius: 5px;
+                min-height: 24px;
+            }
+            QScrollBar::handle:vertical:hover { background: #b3b9c9; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
         """)
 
     # ---------------- UI helpers ----------------
@@ -643,6 +1324,7 @@ class AnnotationApp(QWidget):
 
         # connect
         self.safe_connect_scene()
+        self.update_sam2_selection_label()
         self.label_status.setText(f"Loaded {name} ({index}/{len(self.images)})")
         # fit by default
         self.fit_view()
@@ -656,6 +1338,7 @@ class AnnotationApp(QWidget):
         except RuntimeError:
             pass
         self.update_selected_panel()
+        self.update_sam2_selection_label()
         # update area classes if in change
         if self.get_current_action() == "change" and self.selection_area:
             self.update_area_classes()
@@ -672,6 +1355,15 @@ class AnnotationApp(QWidget):
                 lw.setData(Qt.UserRole, it)  # store ref
                 self.list_selected.addItem(lw)
         self.copy_current_image_path(os.path.join(IMAGES_DIR, self.current_image) if self.current_image else "")
+
+    def update_sam2_selection_label(self):
+        try:
+            count = sum(1 for it in self.bbox_items if it.isSelected())
+            self.sam2_selected.setText(f"Selected boxes: {count}")
+        except RuntimeError:
+            pass
+        except AttributeError:
+            pass
 
     # ---------------- side-panel interactions ----------------
     def copy_current_image_path(self, path):
@@ -760,13 +1452,16 @@ class AnnotationApp(QWidget):
                 pass
         self.rubber = None
         self.selection_area = None
-        # hide area class combo
+        # hide area class row
+        self.area_class_row.setVisible(False)
         if hasattr(self, "combo_area_class"):
             self.combo_area_class.setVisible(False)
 
     def update_area_classes(self):
         # compute classes inside selection_area and populate combo_area_class (and show)
+        show_row = self.get_current_action() == "change"
         if not self.selection_area:
+            self.area_class_row.setVisible(False)
             if hasattr(self, "combo_area_class"):
                 self.combo_area_class.clear()
                 self.combo_area_class.setVisible(False)
@@ -781,14 +1476,16 @@ class AnnotationApp(QWidget):
             if not (xmax < A["xmin"] or xmin > A["xmax"] or ymax < A["ymin"] or ymin > A["ymax"]):
                 if cls_i not in found:
                     found.append(cls_i)
+        self.area_class_row.setVisible(show_row)
         if found:
             items = [f"{i}:{self.classes[i] if i < len(self.classes) else str(i)}" for i in found]
             self.combo_area_class.clear()
             self.combo_area_class.addItems(items)
-            self.combo_area_class.setVisible(True)
+            self.combo_area_class.setVisible(show_row)
             self.label_status.setText("Area selected. Classes: " + ", ".join([self.classes[i] for i in found if i < len(self.classes)]))
         else:
-            self.combo_area_class.clear(); self.combo_area_class.setVisible(True)
+            self.combo_area_class.clear()
+            self.combo_area_class.setVisible(show_row)
             self.combo_area_class.addItem("(no classes in area)")
             self.label_status.setText("Area selected but no known classes inside.")
 
@@ -814,30 +1511,65 @@ class AnnotationApp(QWidget):
 
     # ---------------- action change behavior ----------------
     def on_action_changed(self, text):
-        # Show/hide controls per action
-        if text == "change":
-            self.combo_old_class.setVisible(True)
-            self.combo_new_class.setVisible(True)
+        is_propagate = text == "propagate"
+        self.propagation_options.setVisible(is_propagate)
+        self.old_class_row.setVisible(text in ("delete", "change"))
+        self.new_class_row.setVisible(text == "change")
+
+        if text == "change" and self.selection_area:
+            self.update_area_classes()
         else:
-            self.combo_old_class.setVisible(True)
-            self.combo_new_class.setVisible(False)
+            self.area_class_row.setVisible(False)
             self.combo_area_class.setVisible(False)
-        if text == "propagate":
-            self.label_status.setText("Propagate mode: select multiple boxes (Ctrl/Shift-click).")
+
+        if is_propagate:
+            self.on_propagation_mode_changed()
         else:
-            # clear message but not override useful status
-            if self.label_status.text().startswith("Propagate mode"):
+            self.sam2_options.setVisible(False)
+            self.btn_apply.setText("Apply Action")
+            if self.label_status.text().startswith(
+                ("Propagate", "Static propagation", "Dynamic SAM 2")
+            ):
                 self.label_status.setText("")
+
+    def on_propagation_mode_changed(self):
+        if not self.radio_propagate.isChecked():
+            self.sam2_options.setVisible(False)
+            self.btn_apply.setText("Apply Action")
+            return
+        dynamic = self.radio_prop_sam2.isChecked()
+        self.sam2_options.setVisible(dynamic)
+        self.btn_apply.setText("Start SAM 2 Tracking" if dynamic else "Apply Action")
+        if dynamic:
+            self.label_status.setText(
+                "Dynamic SAM 2: select boxes, choose direction, then Apply Action."
+            )
+        else:
+            self.label_status.setText(
+                "Static propagation: select boxes, then Apply Action."
+            )
+
+    def update_apply_button_text(self):
+        if self.radio_propagate.isChecked() and self.radio_prop_sam2.isChecked():
+            self.btn_apply.setText("Start SAM 2 Tracking")
+        else:
+            self.btn_apply.setText("Apply Action")
 
     # ---------------- Apply action (delete/propagate/change) ----------------
     def on_apply_action(self):
+        if self.sam2_thread is not None and self.sam2_thread.isRunning():
+            self.label_status.setText("SAM 2 tracking is already running.")
+            return
         act = self.get_current_action()
         start_idx = self.current_index
         end_idx = int(self.spin_end.value())
         if act == "delete":
             self.action_delete(start_idx, end_idx)
         elif act == "propagate":
-            self.action_propagate(start_idx, end_idx)
+            if self.radio_prop_sam2.isChecked():
+                self.start_sam2_tracking()
+            else:
+                self.action_propagate(start_idx, end_idx)
         elif act == "change":
             self.action_change(start_idx, end_idx)
         else:
@@ -1066,8 +1798,113 @@ class AnnotationApp(QWidget):
         self.label_status.setText(f"Changed {changed_total} labels.")
         self.load_image(self.current_index)
 
+    # --------------- SAM 2 tracking action ---------------
+    def start_sam2_tracking(self):
+        if self.sam2_thread is not None and self.sam2_thread.isRunning():
+            self.label_status.setText("SAM 2 tracking is already running.")
+            return
+        predict_thread = getattr(self, "predict_thread", None)
+        if predict_thread is not None and predict_thread.isRunning():
+            self.label_status.setText("YOLO prediction is running. Wait for it to finish.")
+            return
+
+        selected = [list(it.parts) for it in self.bbox_items if it.isSelected()]
+        if not selected:
+            self.sam2_status.setText("Select one or more boxes on the current frame first.")
+            self.label_status.setText("SAM 2: no boxes selected.")
+            return
+        if not os.path.exists(SAM2_CHECKPOINT):
+            self.sam2_status.setText("SAM 2 checkpoint missing:\n" + SAM2_CHECKPOINT)
+            self.label_status.setText("SAM 2 checkpoint missing. See the propagation panel.")
+            return
+
+        images = list_images()
+        if not images:
+            self.label_status.setText("No frames found.")
+            return
+
+        direction = ["backward", "forward", "entire"][
+            self.combo_sam2_direction.currentIndex()
+        ]
+        min_confidence = self.spin_sam2_conf.value() / 100.0
+        self.sam2_thread = Sam2TrackThread(
+            images=images,
+            start_index=self.current_index,
+            direction=direction,
+            boxes=selected,
+            images_dir=IMAGES_DIR,
+            labels_dir=LABELS_DIR,
+            checkpoint=SAM2_CHECKPOINT,
+            min_confidence=min_confidence,
+        )
+        self.sam2_thread.progress.connect(self.on_sam2_progress)
+        self.sam2_thread.status.connect(self.on_sam2_status)
+        self.sam2_thread.snapshot.connect(self.on_sam2_snapshot)
+        self.sam2_thread.done.connect(self.on_sam2_done)
+        self.sam2_thread.failed.connect(self.on_sam2_failed)
+
+        self.set_action_controls_enabled(False)
+        self.btn_apply.setText("Tracking...")
+        self.progress_bar.setValue(0)
+        self.sam2_status.setText(
+            f"Starting: {len(selected)} object(s), {direction}, "
+            f"confidence >= {self.spin_sam2_conf.value()}%..."
+        )
+        self.label_status.setText(
+            f"SAM 2: tracking {len(selected)} selected box(es) ({direction})..."
+        )
+        self.sam2_thread.start()
+
+    def on_sam2_progress(self, value):
+        self.progress_bar.setValue(int(value))
+
+    def on_sam2_status(self, message):
+        self.sam2_status.setText(message)
+        self.label_status.setText(message)
+
+    def on_sam2_snapshot(self, files_snapshot):
+        try:
+            if files_snapshot:
+                self.push_undo_snapshot(files_snapshot)
+        except Exception as e:
+            print("on_sam2_snapshot error:", e)
+
+    def set_action_controls_enabled(self, enabled):
+        for widget in (
+            self.btn_apply,
+            self.btn_predict,
+            self.radio_delete,
+            self.radio_propagate,
+            self.radio_change,
+            self.radio_prop_static,
+            self.radio_prop_sam2,
+            self.combo_sam2_direction,
+            self.spin_sam2_conf,
+        ):
+            widget.setEnabled(enabled)
+        self.update_apply_button_text()
+
+    def on_sam2_done(self, message):
+        self.progress_bar.setValue(100)
+        self.set_action_controls_enabled(True)
+        self.load_image(self.current_index)
+        self.sam2_status.setText(message)
+        self.label_status.setText(message)
+        self.update_sam2_selection_label()
+
+    def on_sam2_failed(self, message):
+        self.progress_bar.setValue(0)
+        self.set_action_controls_enabled(True)
+        self.load_image(self.current_index)
+        self.sam2_status.setText("SAM 2 tracking failed. Partial label changes can be undone.")
+        self.label_status.setText("SAM 2 tracking failed. See console for traceback.")
+        print(message)
+
     # --------------- Predict action ---------------
     def on_predict_clicked(self):
+        if self.sam2_thread is not None and self.sam2_thread.isRunning():
+            self.label_status.setText("SAM 2 tracking is running. Wait for it to finish.")
+            return
         model_name = self.combo_models.currentText()
         if not model_name or model_name == "(no models found)":
             self.label_status.setText("No model selected.")
@@ -1100,6 +1937,7 @@ class AnnotationApp(QWidget):
         self.predict_thread.error.connect(self.on_predict_error)
         self.predict_thread.snapshot.connect(self.on_predict_snapshot)  # <-- connect snapshot
         self.btn_predict.setEnabled(False)
+        self.btn_apply.setEnabled(False)
         self.predict_thread.start()
         self.label_status.setText("Predict started...")
 
@@ -1117,12 +1955,16 @@ class AnnotationApp(QWidget):
 
     def on_predict_finished(self, updated, message):
         self.btn_predict.setEnabled(True)
+        self.btn_apply.setEnabled(True)
+        self.update_apply_button_text()
         self.progress_bar.setValue(100)
         self.label_status.setText(message)
         self.load_image(self.current_index)
 
     def on_predict_error(self, msg):
         self.btn_predict.setEnabled(True)
+        self.btn_apply.setEnabled(True)
+        self.update_apply_button_text()
         self.label_status.setText("Predict error. See console.")
         print(msg)
 

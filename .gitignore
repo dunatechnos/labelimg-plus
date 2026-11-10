@@ -1,6 +1,8 @@
 resources/icons/.DS_Store
 resources.py
 labelImg.egg-info*
+labelimg_plus.egg-info*
+*.egg-info*
 
 *.pyc
 .*.swp
@@ -41,3 +43,31 @@ __pycache__/
 .unison*
 .attach*
 tmp.*
+# SAM3 16-bit checkpoints + working clips (large, machine-local, auto-created)
+*.pt
+*_work_*p.mp4
+sam3track_*/
+# Helper runtime folders when launched from repo root (user data, never commit)
+/labels/
+/images/
+prod_*/
+# SAM2 checkpoints (large, machine-local)
+sam2_models/
+annotation_helper/sam2_models/
+# Local YOLO/SAM checkpoints + user data (never commit)
+annotation_helper/models/
+models/
+# Datasets / bulk media (never commit)
+Dataset_new/
+dataset2/
+merged_data/
+500145_pretagged/
+Annotation_test_k/
+cs-videos-od-dset17_8_k/
+guarding-cameras-batch2-buckets-20260824_k/
+*.mp4
+*.avi
+*.mov
+# One-off local scripts (kept in dev folder only)
+annotation_helper/app.py
+annotation_helper/labelImg.py

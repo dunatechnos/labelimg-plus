@@ -25,7 +25,8 @@ bear
 package
 face
 hardhat
+lpr
+pig
 pistol
 rifle
 license_plate
-pig

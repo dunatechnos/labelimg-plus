@@ -1,0 +1,9 @@
+PyQt5
+lxml
+Pillow
+PyYAML
+opencv-python
+ultralytics
+hydra-core
+iopath
+numpy

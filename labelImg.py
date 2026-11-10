@@ -437,6 +437,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.menuBar().insertAction(self.menus.edit.menuAction(), actHelperBack)
         # --- END Annotation Helper button ---
 
+    
         # Auto saving : Enable auto saving if pressing next
         self.auto_saving = QAction(get_str('autoSaveMode'), self)
         self.auto_saving.setCheckable(True)
@@ -756,6 +757,7 @@ class MainWindow(QMainWindow, WindowMixin):
 
         except:
             pass
+
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Control:

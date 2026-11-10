@@ -1,2 +1,9 @@
-pyqt5==5.14.1
-lxml==4.9.1
+pyqt5
+lxml
+Pillow
+PyYAML
+opencv-python
+ultralytics
+hydra-core
+iopath
+numpy
