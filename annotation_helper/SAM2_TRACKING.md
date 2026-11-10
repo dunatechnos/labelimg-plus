@@ -14,6 +14,10 @@ existing **Propagate** action.
 5. Choose the propagation type:
    - **Static Propagation** — the old copy-selected-boxes-to-frames behavior
    - **Dynamic SAM 2** — SAM 2 tracking
+6. Pick the SAM 2 model:
+   - **Small (accurate, ~176 MB)** — best quality
+   - **Tiny (fast, ~149 MB)** — ~15–25% faster on CPU, slightly lower quality.
+     Good for slow machines. Both download automatically on first use.
 6. For Dynamic SAM 2, choose the direction:
    - **Backward** — current frame to the first frame
    - **Forward** — current frame to the last frame
@@ -73,10 +77,13 @@ Normalized to the original frame size (6 decimal places).
 - SAM 2 package: installed editable from
   `C:\Users\kesha\Downloads\Sam2\sam2`
 - Dependencies added: `hydra-core`, `iopath`
-- Checkpoint:
+- Checkpoints (both auto-download on first use, git-ignored):
   `annotation_helper/sam2_models/sam2.1_hiera_small.pt`
   (~176 MB, official Meta release:
   https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt)
+  `annotation_helper/sam2_models/sam2.1_hiera_tiny.pt`
+  (~149 MB, official Meta release:
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt)
 - **First use: the checkpoint downloads automatically** (one-time, ~176 MB)
   when tracking starts, or via the **Download model** button in the
   Dynamic SAM 2 panel. It is git-ignored, so end users never need to
