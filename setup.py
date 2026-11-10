@@ -16,7 +16,7 @@ about = {}
 with open(os.path.join(here, 'libs', '__init__.py')) as f:
     exec(f.read(), about)
 
-with open("README.rst", "rb") as readme_file:
+with open("README.md", "rb") as readme_file:
     readme = readme_file.read().decode("UTF-8")
 
 with open("HISTORY.rst", "rb") as history_file:
@@ -87,6 +87,7 @@ setup(
     version=about['__version__'],
     description="LabelImg Plus is a graphical image annotation tool with YOLO prediction and SAM2 video tracking",
     long_description=readme + '\n\n' + history,
+    long_description_content_type="text/markdown",
     author="TzuTa Lin",
     author_email='tzu.ta.lin@gmail.com',
     maintainer="Duna Keshav Rao",
