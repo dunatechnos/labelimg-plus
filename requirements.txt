@@ -1,9 +1,26 @@
+# LabelImg Plus — core dependencies (annotation helper + YOLO predict)
+# Install:  pip install -r requirements.txt
 PyQt5
 lxml
 Pillow
 PyYAML
 opencv-python
+numpy
 ultralytics
 hydra-core
 iopath
-numpy
+
+# ---------- GPU vs CPU (PyTorch) ----------
+# 'ultralytics' apne saath torch le aata hai (default: CUDA build, ~800MB+).
+# GPU nahi hai to PEHLE CPU wala torch lagao, phir upar wali list:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# App khud detect karti hai: GPU hua to cuda, nahi to cpu (koi setting nahi).
+# CPU par SAM 2 tracking chalti hai, bas slow (~1.3 sec/frame, small model).
+
+# ---------- SAM 2 video tracking (optional, Dynamic SAM 2 ke liye) ----------
+# Model file (.pt, ~176MB) app PEHLI BAAR khud download kar leti hai.
+# Sirf ye package ek baar manually install karna hai (PyPI par official
+# 'sam2' package nahi hai, isliye neeche git URL diya hai — commented hai
+# taaki 'pip install -r' kabhi fail na ho):
+#     CPU-only:  SAM2_BUILD_CUDA=0 pip install git+https://github.com/facebookresearch/sam2.git --no-deps
+#     GPU:       pip install git+https://github.com/facebookresearch/sam2.git --no-deps
