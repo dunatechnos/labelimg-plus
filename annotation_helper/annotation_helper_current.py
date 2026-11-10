@@ -537,10 +537,11 @@ class Sam2TrackThread(QThread):
             except ImportError:
                 raise RuntimeError(
                     "The 'sam2' package is not installed.\n"
-                    "Install it with:\n"
+                    "Install it once with:\n"
                     "  pip install hydra-core iopath\n"
-                    "  $env:SAM2_BUILD_CUDA=\"0\"\n"
-                    "  pip install -e <sam2-repo> --no-deps  (or pip install sam2)\n"
+                    "  pip install git+https://github.com/facebookresearch/sam2.git --no-deps\n"
+                    "(needs Git; on CPU-only Windows run "
+                    "$env:SAM2_BUILD_CUDA=\"0\" first)\n"
                     "then retry."
                 )
 

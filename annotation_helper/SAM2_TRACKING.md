@@ -90,14 +90,14 @@ Normalized to the original frame size (6 decimal places).
 ## Reinstall (if the environment is recreated)
 
 ```powershell
-conda activate lbl_env
 pip install hydra-core iopath
-$env:SAM2_BUILD_CUDA="0"
-pip install -e C:\Users\kesha\Downloads\Sam2\sam2 --no-deps
+# CPU-only machine par pehle: $env:SAM2_BUILD_CUDA="0"
+pip install git+https://github.com/facebookresearch/sam2.git --no-deps
 ```
 
-Then make sure the `sam2` package is installed (see above). The checkpoint
-itself downloads automatically on first use — no manual step needed.
+(Git installed hona chahiye. Note: `pip install sam2` kaam nahi karega —
+PyPI par official package nahi hai. Model checkpoint app pehli baar khud
+download kar leti hai — koi manual step nahi.)
 
 ## Notes
 

@@ -22,6 +22,7 @@ pandas  # tools/label_to_csv.py
 # Model file (.pt, ~176MB) app PEHLI BAAR khud download kar leti hai.
 # Sirf ye package ek baar manually install karna hai (PyPI par official
 # 'sam2' package nahi hai, isliye neeche git URL diya hai — commented hai
-# taaki 'pip install -r' kabhi fail na ho):
+# taaki 'pip install -r' kabhi fail na ho. Note: 'pip install sam2' kaam
+# NAHI karega (PyPI par official package nahi hai). Git installed hona chahiye.
 #     CPU-only:  SAM2_BUILD_CUDA=0 pip install git+https://github.com/facebookresearch/sam2.git --no-deps
 #     GPU:       pip install git+https://github.com/facebookresearch/sam2.git --no-deps
