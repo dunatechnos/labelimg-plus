@@ -7,8 +7,9 @@ PyYAML
 opencv-python
 numpy
 ultralytics
-hydra-core
-iopath
+hydra-core  # sam2 runtime
+iopath  # sam2 runtime
+pandas  # tools/label_to_csv.py
 
 # GPU nahi hai to pehle: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 # SAM 2 tracking ke liye (optional): SAM2_BUILD_CUDA=0 pip install git+https://github.com/facebookresearch/sam2.git --no-deps

@@ -7,8 +7,9 @@ PyYAML
 opencv-python
 numpy
 ultralytics
-hydra-core
-iopath
+hydra-core  # sam2 runtime
+iopath  # sam2 runtime
+pandas  # tools/label_to_csv.py
 
 # ---------- GPU vs CPU (PyTorch) ----------
 # 'ultralytics' apne saath torch le aata hai (default: CUDA build, ~800MB+).
