@@ -54,6 +54,13 @@ def kernel_title(job_id: str) -> str:
     return title
 
 
+def title_from_slug(slug: str) -> str:
+    """Human title that slugifies back to the given fixed kernel slug."""
+    words = [part for part in re.split(r"[-_]+", slug or "") if part]
+    title = " ".join(word.capitalize() for word in words)[:50].strip()
+    return title if len(title) >= 5 else "LabelImg Plus Runner"
+
+
 def kernel_id_for(username: str, job_id: str, prefix: str = DEFAULT_KERNEL_PREFIX) -> str:
     owner = validate_slug((username or "").strip().lower(), "Kaggle username")
     return f"{owner}/{job_slug(prefix, job_id)}"

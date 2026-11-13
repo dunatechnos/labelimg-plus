@@ -30,6 +30,9 @@ DEFAULT_TIMEOUT_HOURS = 6.0
 DEFAULT_MAX_BUNDLE_MB = 4096.0
 DEFAULT_WEIGHTS_DATASET = "labelimg-plus-weights"
 DEFAULT_WEIGHTS_ROOT = "kaggle_weights"
+DEFAULT_KERNEL_SLUG = "labelimg-plus-runner"
+DEFAULT_SESSION_PREFIX = "labelimg-plus-session"
+DEFAULT_MAX_SESSION_GB = 20.0
 KAGGLE_VENV_DIR = ".kaggle-venv"
 KAGGLE_JOB_DIR = "kaggle_jobs"
 
@@ -204,6 +207,12 @@ class Config:
     use_weights_dataset: bool = True
     weights_dataset: str = DEFAULT_WEIGHTS_DATASET
     weights_root: Path = field(default_factory=lambda: repo_root() / DEFAULT_WEIGHTS_ROOT)
+    use_session_dataset: bool = True
+    fixed_kernel: bool = True
+    kernel_slug: str = DEFAULT_KERNEL_SLUG
+    session_dataset_prefix: str = DEFAULT_SESSION_PREFIX
+    max_session_gb: float = DEFAULT_MAX_SESSION_GB
+    session_keep_local: bool = False
     poll_seconds: int = DEFAULT_POLL_SECONDS
     timeout_hours: float = DEFAULT_TIMEOUT_HOURS
     delete_dataset_after: bool = True
@@ -272,6 +281,8 @@ class Config:
             f"job root: {self.job_root}",
             f"weights dataset: {self.weights_dataset}",
             f"use weights dataset: {self.use_weights_dataset}",
+            f"session dataset: {self.use_session_dataset}",
+            f"fixed kernel: {self.kernel_slug if self.fixed_kernel else '(per job)'}",
             f"accelerator: {self.accelerator}",
         ]
         return lines
@@ -440,6 +451,24 @@ def _config_from_env(root: Path, env_path: Path) -> Config:
     if not weights_root.is_absolute():
         weights_root = root / weights_root
     cfg.weights_root = weights_root
+    cfg.use_session_dataset = _truthy(
+        cfg.get("KAGGLE_USE_SESSION_DATASET"), True
+    )
+    cfg.fixed_kernel = _truthy(cfg.get("KAGGLE_FIXED_KERNEL"), True)
+    cfg.kernel_slug = (
+        cfg.get("KAGGLE_KERNEL_SLUG", DEFAULT_KERNEL_SLUG).strip().lower()
+        or DEFAULT_KERNEL_SLUG
+    )
+    cfg.session_dataset_prefix = (
+        cfg.get("KAGGLE_SESSION_DATASET_PREFIX", DEFAULT_SESSION_PREFIX).strip().lower()
+        or DEFAULT_SESSION_PREFIX
+    )
+    cfg.max_session_gb = max(
+        0.5, _as_float(cfg.get("KAGGLE_MAX_SESSION_GB"), DEFAULT_MAX_SESSION_GB)
+    )
+    cfg.session_keep_local = _truthy(
+        cfg.get("KAGGLE_SESSION_KEEP_LOCAL"), False
+    )
     cfg.poll_seconds = max(5, _as_int(cfg.get("KAGGLE_POLL_SECONDS"), DEFAULT_POLL_SECONDS))
     cfg.timeout_hours = max(
         0.25, _as_float(cfg.get("KAGGLE_TIMEOUT_HOURS"), DEFAULT_TIMEOUT_HOURS)

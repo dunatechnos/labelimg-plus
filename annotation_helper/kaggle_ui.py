@@ -46,6 +46,7 @@ from kaggle_bridge.config import (
 from kaggle_bridge.doctor import doctor_lines
 from kaggle_bridge.jobstore import JobBusyError, JobNotFoundError, JobStore
 from kaggle_bridge.kaggle_cli import KaggleCLI, KaggleCliError
+from kaggle_bridge.session import RemoteSession
 from kaggle_bridge.setup import create_venv
 from kaggle_bridge.spec import JobSpec, SpecError
 from kaggle_bridge.weights import sync_weights
@@ -145,6 +146,39 @@ class KaggleTestThread(QThread):
             self.done.emit(f"Connected as {username} ({version}).")
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class KaggleSessionThread(QThread):
+    progress = pyqtSignal(int, str)
+    status = pyqtSignal(str)
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, images_dir: str, images: List[str], classes: List[str], parent=None):
+        super().__init__(parent)
+        self.images_dir = images_dir
+        self.images = list(images)
+        self.classes = list(classes)
+
+    def run(self):
+        try:
+            cfg = load_config()
+            cli = KaggleCLI(cfg)
+            username = cli.check_auth()
+            session = RemoteSession(cfg, cli, log=self.status.emit)
+            info = session.ensure_images(
+                self.images_dir,
+                self.images,
+                self.classes,
+                progress=lambda percent, message: (
+                    self.progress.emit(int(percent), str(message)),
+                    self.status.emit(str(message)),
+                ),
+                username=username,
+            )
+            self.done.emit(info)
+        except Exception as exc:
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
 
 
 class KaggleWeightsThread(QThread):

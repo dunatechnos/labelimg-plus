@@ -13,6 +13,7 @@ import sys
 import cv2
 import time
 import shutil
+import subprocess
 import tempfile
 import traceback
 import urllib.request
@@ -48,6 +49,7 @@ try:
     from annotation_helper.kaggle_ui import (
         KaggleJobThread,
         KaggleJobsDialog,
+        KaggleSessionThread,
         KaggleSettingsDialog,
     )
     from kaggle_bridge.config import load_config
@@ -58,6 +60,7 @@ except Exception as _kaggle_import_error:
         from kaggle_ui import (  # type: ignore
             KaggleJobThread,
             KaggleJobsDialog,
+            KaggleSessionThread,
             KaggleSettingsDialog,
         )
         from kaggle_bridge.config import load_config
@@ -901,6 +904,9 @@ class AnnotationApp(QWidget):
         self.custom_target_indices = None    # <-- ADD THIS HERE
         self.sam2_thread = None
         self.kaggle_thread = None
+        self.kaggle_session_thread = None
+        self.kaggle_session_info = None
+        self._kaggle_cleanup_connected = False
 
 
         self.current_index = 1 if self.images else 0
@@ -922,6 +928,13 @@ class AnnotationApp(QWidget):
         self.on_action_changed("delete")
         self.update_sam2_model_label()
         self.refresh_kaggle_status()
+
+        # Delete the remote session image dataset when LabelImg exits.  A
+        # previous crashed session is cleaned on the next launch too.
+        app = QApplication.instance()
+        if app is not None and KAGGLE_UI_AVAILABLE and not self._kaggle_cleanup_connected:
+            app.aboutToQuit.connect(self.cleanup_kaggle_session)
+            self._kaggle_cleanup_connected = True
 
         # keyboard shortcuts
         self.setup_shortcuts()
@@ -1503,6 +1516,12 @@ class AnnotationApp(QWidget):
         self.models = scan_models()
         self.refresh_full_class_list()
         self.refresh_models()
+        if (
+            KAGGLE_UI_AVAILABLE
+            and hasattr(self, "chk_kaggle")
+            and self.chk_kaggle.isChecked()
+        ):
+            self.start_kaggle_session_prepare()
         max_count = max(1, len(self.images))
         self.spin_index.setMaximum(max_count)
         self.spin_end.setMaximum(max_count)
@@ -2407,17 +2426,149 @@ class AnnotationApp(QWidget):
                 self.btn_kaggle_jobs.setEnabled(False)
             return
         _cfg, blockers = self._kaggle_blockers()
-        if not blockers:
+        if blockers:
+            self.kaggle_status.setText("Kaggle: setup needed")
+            self.kaggle_status.setToolTip("\n".join(blockers))
+        elif self.kaggle_session_thread is not None and self.kaggle_session_thread.isRunning():
+            self.kaggle_status.setText("Kaggle: uploading session images...")
+            self.kaggle_status.setToolTip(
+                "One-time upload of the current images folder. Later clicks "
+                "send only a small command."
+            )
+        elif self.kaggle_session_info is not None:
+            self.kaggle_status.setText(
+                f"Kaggle: session ready ({self.kaggle_session_info.image_count} images)"
+            )
+            self.kaggle_status.setToolTip(
+                "Images are on Kaggle. Each Predict/SAM 2 click sends only the "
+                "command and receives coordinates."
+            )
+        else:
             self.kaggle_status.setText("Kaggle: ready for T4 x2 jobs")
             self.kaggle_status.setToolTip(
                 "Tick the checkbox, then use Predict or Dynamic SAM 2. "
                 "Results download and merge automatically."
             )
-        else:
-            self.kaggle_status.setText("Kaggle: setup needed")
-            self.kaggle_status.setToolTip("\n".join(blockers))
         if hasattr(self, "chk_kaggle") and not self.chk_kaggle.isChecked():
             self.chk_kaggle.setEnabled(True)
+
+    def start_kaggle_session_prepare(self):
+        """Upload the current images folder once (background, pre-warm)."""
+        if not KAGGLE_UI_AVAILABLE:
+            return
+        if self.kaggle_session_thread is not None and self.kaggle_session_thread.isRunning():
+            return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            return
+        images = list_images()
+        if not images:
+            return
+        thread = KaggleSessionThread(
+            IMAGES_DIR,
+            images,
+            read_classes(),
+            parent=self,
+        )
+        thread.progress.connect(self.on_kaggle_session_progress)
+        thread.status.connect(self.on_kaggle_session_status)
+        thread.done.connect(self.on_kaggle_session_done)
+        thread.failed.connect(self.on_kaggle_session_failed)
+        thread.finished.connect(self._on_kaggle_session_finished)
+        self.kaggle_session_thread = thread
+        self.btn_predict.setEnabled(False)
+        self.btn_apply.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.kaggle_status.setText("Kaggle: uploading session images (one-time)...")
+        self.label_status.setText(
+            "Kaggle: packing/uploading the current images folder once. "
+            "Later clicks will only send a command."
+        )
+        thread.start()
+
+    def on_kaggle_session_progress(self, percent, message):
+        self.progress_bar.setValue(int(percent))
+        self.kaggle_status.setText(f"Kaggle session: {message}")
+
+    def on_kaggle_session_status(self, message):
+        self.kaggle_status.setText(f"Kaggle session: {message}")
+        self.label_status.setText(message)
+
+    def on_kaggle_session_done(self, info):
+        self.kaggle_session_info = info
+        self.progress_bar.setValue(100)
+        self.kaggle_status.setText(
+            f"Kaggle: session ready ({info.image_count} images)"
+        )
+        self.label_status.setText(
+            f"Kaggle session ready: {info.image_count} images uploaded once. "
+            "Predict/SAM 2 clicks will now send only the command."
+        )
+
+    def on_kaggle_session_failed(self, message):
+        self.progress_bar.setValue(0)
+        self.kaggle_status.setText("Kaggle: session upload failed")
+        self.label_status.setText("Kaggle session upload failed. See console.")
+        print(message)
+        short = str(message)
+        if len(short) > 1800:
+            short = short[:1800] + "\n..."
+        QMessageBox.warning(self, "Kaggle session upload failed", short)
+
+    def _on_kaggle_session_finished(self):
+        self.kaggle_session_thread = None
+        self.btn_predict.setEnabled(True)
+        self.btn_apply.setEnabled(True)
+        self.update_apply_button_text()
+        self.refresh_kaggle_status()
+
+    def _spawn_session_cleanup(self, stale_hours=None):
+        """Delete the remote session dataset in a detached process."""
+        if not KAGGLE_UI_AVAILABLE:
+            return
+        cmd = [sys.executable, "-m", "kaggle_bridge", "session-cleanup", "--quiet"]
+        if stale_hours is not None:
+            cmd += ["--stale-hours", str(stale_hours)]
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
+        try:
+            subprocess.Popen(
+                cmd,
+                cwd=_REPO_ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=flags,
+                close_fds=True,
+                start_new_session=(os.name != "nt"),
+            )
+        except Exception as exc:
+            print("Kaggle session cleanup spawn failed:", exc)
+
+    def cleanup_kaggle_session(self):
+        """Called by QApplication.aboutToQuit: wait for a running job, then delete."""
+        if not KAGGLE_UI_AVAILABLE:
+            return
+        # Wait for a running job so coordinates are not lost.  Cap the wait
+        # so a queued Kaggle job cannot keep the whole app open for hours.
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Kaggle job running",
+                "A Kaggle job is still running. LabelImg will wait for it to "
+                "finish before deleting the session image dataset.",
+            )
+            if not self.kaggle_thread.wait(10 * 60 * 1000):
+                print("Kaggle job still running; leaving the session dataset for next launch.")
+                return
+        if (
+            self.kaggle_session_thread is not None
+            and self.kaggle_session_thread.isRunning()
+        ):
+            if not self.kaggle_session_thread.wait(10 * 60 * 1000):
+                print("Session upload still running; leaving it for next launch.")
+                return
+        self._spawn_session_cleanup()
 
     def on_kaggle_toggled(self, checked):
         if checked and not KAGGLE_UI_AVAILABLE:
@@ -2435,6 +2586,7 @@ class AnnotationApp(QWidget):
             self.label_status.setText(
                 "Kaggle mode ON: Predict and Dynamic SAM 2 will run on T4 x2."
             )
+            self.start_kaggle_session_prepare()
         else:
             self.label_status.setText("Kaggle mode OFF: heavy work runs locally.")
 
@@ -2577,6 +2729,17 @@ class AnnotationApp(QWidget):
         )
 
     def _start_kaggle_job(self, spec, label):
+        if (
+            self.kaggle_session_thread is not None
+            and self.kaggle_session_thread.isRunning()
+        ):
+            QMessageBox.information(
+                self,
+                "Kaggle session",
+                "The current images folder is still uploading to Kaggle. "
+                "Wait for 'Kaggle: session ready' and click again.",
+            )
+            return
         cfg, blockers = self._kaggle_blockers()
         if blockers:
             answer = QMessageBox.question(

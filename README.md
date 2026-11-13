@@ -36,9 +36,10 @@ It helps with:
 
 Heavy YOLO prediction and Dynamic SAM 2 tracking can run on Kaggle's 2x T4
 GPUs instead of the local machine.  Models/checkpoints are uploaded once to a
-private Kaggle weights dataset; later jobs send only images + current labels.
-Only YOLO coordinates come back, and the changed frame is shown in LabelImg
-(with Undo).
+private Kaggle weights dataset; the current images folder is uploaded once per
+app session.  Later clicks send only a small command (~0.5-1 KB), reuse the
+fixed kernel, and return only YOLO coordinates.  The changed frame is shown in
+LabelImg (with Undo).  Closing LabelImg deletes the session image dataset.
 
 Setup, quotas, troubleshooting and the full architecture are in
 [annotation_helper/KAGGLE_SAM2.md](annotation_helper/KAGGLE_SAM2.md).

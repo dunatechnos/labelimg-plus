@@ -36,6 +36,11 @@ def doctor_lines(
     lines.append(f"Dataset prefix: {cfg.dataset_prefix}")
     lines.append(f"Weights ds:   {cfg.weights_dataset}")
     lines.append(f"Reuse weights: {cfg.use_weights_dataset}")
+    lines.append(f"Session ds:   {cfg.use_session_dataset} ({cfg.session_dataset_prefix})")
+    lines.append(
+        f"Kernel:       "
+        f"{cfg.kernel_slug if cfg.fixed_kernel else '(new per click)'}"
+    )
     lines.append(f"Accelerator:  {cfg.accelerator}")
     lines.append("")
 

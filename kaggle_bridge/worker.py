@@ -9,6 +9,8 @@ The worker is deliberately UI-free.  The Qt layer only supplies callbacks.
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import time
 import traceback
@@ -28,7 +30,13 @@ from .metadata import (
     kernel_id_for,
     kernel_metadata,
     kernel_title,
+    title_from_slug,
     write_json_atomic,
+)
+from .session import (
+    RemoteSession,
+    build_command_payload,
+    embed_command,
 )
 from .spec import JobSpec
 from .weights import WeightsManager
@@ -152,16 +160,30 @@ class KaggleJobRunner:
             self.cfg.username = username
             self._log(f"Kaggle user: {username}", job_id)
 
-            dataset_id = dataset_id_for(username, self.cfg.dataset_prefix, job_id)
-            # Kaggle rejects a kernel and a dataset that share the same slug
-            # (409 SaveKernel), so the kernel deliberately gets its own prefix.
-            kernel_id = kernel_id_for(username, job_id)
+            use_session = bool(self.cfg.use_session_dataset)
+            if use_session:
+                dataset_id = None
+                if self.cfg.fixed_kernel:
+                    kernel_id = f"{username}/{self.cfg.kernel_slug}"
+                    fixed_title = title_from_slug(self.cfg.kernel_slug)
+                else:
+                    kernel_id = kernel_id_for(username, job_id)
+                    fixed_title = kernel_title(job_id)
+            else:
+                dataset_id = dataset_id_for(
+                    username, self.cfg.dataset_prefix, job_id
+                )
+                # Kaggle rejects a kernel and a dataset that share the same
+                # slug (409 SaveKernel), so the kernel gets its own prefix.
+                kernel_id = kernel_id_for(username, job_id)
+                fixed_title = kernel_title(job_id)
             kernel_ref = kernel_id
             weights_dataset_id = None
             self._update(
                 job_id,
                 dataset_ref=dataset_id,
                 kernel_ref=kernel_id,
+                fixed_kernel_title=fixed_title,
                 message=f"Kaggle user: {username}",
             )
 
@@ -233,6 +255,18 @@ class KaggleJobRunner:
                         "Model weights ready on Kaggle; only images/labels "
                         "will be uploaded for this job."
                     ),
+                )
+
+            if use_session:
+                return self._run_session_mode(
+                    job_id=job_id,
+                    spec=spec,
+                    cli=cli,
+                    username=username,
+                    kernel_id=kernel_id,
+                    fixed_title=fixed_title,
+                    weights_dataset_id=weights_dataset_id,
+                    model_override=model_override,
                 )
 
             # ----------------------------------------------------------
@@ -405,6 +439,14 @@ class KaggleJobRunner:
     ) -> Optional[JobResult]:
         record = self.store.load(job_id)
         state = record.get("state", "")
+        if self.cfg.use_session_dataset and not record.get("kernel_run_ref"):
+            # The fixed kernel's latest version may belong to a previous job;
+            # never resume an unpushed session job from someone else's output.
+            self._log(
+                "Session job has no kernel version yet; preparing a fresh run.",
+                job_id,
+            )
+            return None
         output_dir = self.store.output_dir(job_id)
         has_output = (output_dir / "result.json").is_file() or bool(
             list(output_dir.glob("**/result.json"))
@@ -424,27 +466,28 @@ class KaggleJobRunner:
             self._log("Resuming at local import.", job_id)
             return self._import_only(job_id, spec, output_dir)
 
-        status = cli.kernels_status(kernel_ref)
-        self._log(f"Resume status for {kernel_ref}: {status.state}", job_id)
+        run_ref = record.get("kernel_run_ref") or kernel_ref
+        status = cli.kernels_status(run_ref)
+        self._log(f"Resume status for {run_ref}: {status.state}", job_id)
         if status.state in ("QUEUED", "RUNNING"):
             self._update(
                 job_id,
                 state="running" if status.state == "RUNNING" else "queued",
                 message=f"Kernel {status.state.lower()} on Kaggle.",
             )
-            final = self._wait_for_kernel(job_id, cli, kernel_ref, spec)
+            final = self._wait_for_kernel(job_id, cli, run_ref, spec)
             if not final.success:
-                logs = self._fetch_kernel_logs(job_id, cli, kernel_ref)
+                logs = self._fetch_kernel_logs(job_id, cli, run_ref)
                 raise KaggleJobError(
                     f"Kaggle kernel failed: {final.state}. {final.failure or ''}\n{logs}",
                     job_id,
                     self.store.job_dir(job_id) / "logs" / "kernel.log",
                 )
-            return self._download_and_import(job_id, spec, cli, kernel_ref)
+            return self._download_and_import(job_id, spec, cli, run_ref)
         if status.state == "COMPLETE":
-            return self._download_and_import(job_id, spec, cli, kernel_ref)
+            return self._download_and_import(job_id, spec, cli, run_ref)
         if status.state in ("ERROR", "CANCEL_ACKNOWLEDGED", "CANCEL_REQUESTED"):
-            logs = self._fetch_kernel_logs(job_id, cli, kernel_ref)
+            logs = self._fetch_kernel_logs(job_id, cli, run_ref)
             raise KaggleJobError(
                 f"Kaggle kernel ended with {status.state}. {status.failure or ''}\n{logs}",
                 job_id,
@@ -453,6 +496,147 @@ class KaggleJobRunner:
         # Unknown / missing kernel: fall through to a fresh bundle+push.
         self._log("Previous kernel is not resumable; preparing a fresh run.", job_id)
         return None
+
+    # ------------------------------------------------------------------
+    # Fast session mode: images once, command embedded per click
+    # ------------------------------------------------------------------
+    def _run_session_mode(
+        self,
+        job_id: str,
+        spec: JobSpec,
+        cli: KaggleCLI,
+        username: str,
+        kernel_id: str,
+        fixed_title: str,
+        weights_dataset_id: Optional[str],
+        model_override: Optional[Dict[str, Any]],
+    ) -> JobResult:
+        self._update(
+            job_id,
+            state="bundling",
+            progress=2,
+            message="Preparing Kaggle session images (one-time per app session)...",
+            error=None,
+        )
+        session = RemoteSession(
+            self.cfg, cli, log=lambda msg: self._log(msg, job_id)
+        )
+
+        def session_progress(percent: int, message: str) -> None:
+            self._progress(2 + int(48 * max(0, min(100, percent)) / 100), message)
+
+        info = session.ensure_images(
+            spec.images_dir,
+            spec.images,
+            spec.classes,
+            progress=session_progress,
+            username=username,
+        )
+        self._update(
+            job_id,
+            progress=50,
+            session_dataset=info.dataset_ref,
+            images_count=info.image_count,
+            message=(
+                f"Session ready: {info.image_count} image(s) on Kaggle. "
+                "Only the command will be sent per click."
+            ),
+        )
+
+        command = build_command_payload(spec, model_override, info, job_id)
+        command_bytes = len(
+            json.dumps(command, ensure_ascii=False).encode("utf-8")
+        )
+        self._update(
+            job_id,
+            progress=55,
+            bundle_bytes=command_bytes,
+            message="Command ready; pushing it to the fixed Kaggle kernel...",
+        )
+
+        kernel_dir = self._prepare_kernel_folder_session(
+            job_id,
+            info.dataset_ref,
+            kernel_id,
+            fixed_title,
+            command,
+            weights_dataset_id,
+        )
+        self._update(
+            job_id,
+            state="pushing_kernel",
+            progress=60,
+            message="Pushing fixed Kaggle kernel (T4 x2)...",
+        )
+        push_result = cli.kernels_push(
+            kernel_dir, accelerator=self.cfg.accelerator
+        )
+        version = self._parse_kernel_version(push_result.output)
+        kernel_run_ref = f"{kernel_id}/{version}" if version else kernel_id
+        self._update(
+            job_id,
+            state="queued",
+            progress=63,
+            kernel_ref=kernel_id,
+            kernel_run_ref=kernel_run_ref,
+            kernel_url=f"https://www.kaggle.com/code/{kernel_id}",
+            message=(
+                f"Kernel version {version} queued on Kaggle (T4 x2)."
+                if version
+                else "Kernel queued on Kaggle (T4 x2)."
+            ),
+        )
+        self._log(push_result.output, job_id)
+
+        status = self._wait_for_kernel(job_id, cli, kernel_run_ref, spec)
+        if not status.success:
+            logs = self._fetch_kernel_logs(job_id, cli, kernel_run_ref)
+            raise KaggleJobError(
+                "Kaggle kernel did not complete successfully: "
+                f"{status.state}. {status.failure or ''}\n{logs}".strip(),
+                job_id,
+                self.store.job_dir(job_id) / "logs" / "kernel.log",
+            )
+        return self._download_and_import(job_id, spec, cli, kernel_run_ref)
+
+    def _prepare_kernel_folder_session(
+        self,
+        job_id: str,
+        session_dataset: str,
+        kernel_id: str,
+        fixed_title: str,
+        command: Dict[str, Any],
+        weights_dataset_id: Optional[str],
+    ) -> Path:
+        kernel_dir = self.store.kernel_dir(job_id)
+        shutil.rmtree(kernel_dir, ignore_errors=True)
+        kernel_dir.mkdir(parents=True, exist_ok=True)
+        source = (Path(__file__).resolve().parent / "kernel_runner.py").read_text(
+            encoding="utf-8"
+        )
+        embedded = embed_command(source, command)
+        (kernel_dir / "runner.py").write_text(embedded, encoding="utf-8")
+        extra = [weights_dataset_id] if weights_dataset_id else []
+        write_json_atomic(
+            kernel_dir / "kernel-metadata.json",
+            kernel_metadata(
+                kernel_id,
+                fixed_title,
+                session_dataset,
+                code_file="runner.py",
+                accelerator=self.cfg.accelerator,
+                extra_dataset_sources=extra,
+            ),
+        )
+        return kernel_dir
+
+    @staticmethod
+    def _parse_kernel_version(output: str) -> Optional[int]:
+        text = output or ""
+        match = re.search(r"Kernel version\s+(\d+)\s+successfully", text, re.IGNORECASE)
+        if not match:
+            match = re.search(r"Kernel version\s+(\d+)", text, re.IGNORECASE)
+        return int(match.group(1)) if match else None
 
     # ------------------------------------------------------------------
     # Preparation

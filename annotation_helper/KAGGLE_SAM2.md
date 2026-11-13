@@ -13,14 +13,18 @@ KaggleJobThread ──► KaggleJobRunner
         │
         ├─ 1. reuse model/checkpoint from the private weights dataset
         │     (models are uploaded only ONCE)
-        ├─ 2. pack only images + current labels into a tiny job.zip
-        ├─ 3. create a private job dataset (Kaggle auto-extracts the zip)
-        ├─ 4. push a private script kernel on NvidiaTeslaT4 (2x T4)
-        ├─ 5. poll status every 30 s
-        ├─ 6. download coordinates.json + result.json (no images back)
-        └─ 7. merge coordinates into local labels/ + Undo snapshot,
+        ├─ 2. upload the current images folder ONCE per app session
+        │     (private session dataset; reused by every click)
+        ├─ 3. per click: embed the tiny command (prompts/labels/params)
+        │     into a new version of ONE fixed kernel (no command dataset)
+        ├─ 4. the kernel mounts session + weights, runs on NvidiaTeslaT4
+        ├─ 5. download coordinates.json + result.json (no images back)
+        └─ 6. merge coordinates into local labels/ + Undo snapshot,
               then jump to the first changed frame so boxes are visible
 ```
+
+When LabelImg closes, the session image dataset is deleted automatically;
+the model weights dataset and the reusable kernel stay.
 
 ### Models once, images later
 
@@ -30,9 +34,12 @@ selected images, their current labels and a tiny manifest.  The kernel mounts
 the weights dataset alongside the job dataset, reads the model/checkpoint from
 `/kaggle/input/...`, runs inference, and returns **only YOLO coordinates**.
 
-Example from the live validation: the job bundle for one image dropped from
-~153 MB (model inside the bundle) to **0.14 MB** (model reused), while still
-producing 7 predicted boxes.
+Example from the live validation:
+
+* models inside every job: ~153 MB per click
+* model reused from weights dataset: **0.14 MB per click**
+* session mode (images uploaded once, command embedded): **578 bytes per click**
+* SAM 2 with local wheel + reused checkpoint: 5/5 frames in ~121 s
 
 Run the one-time sync explicitly if you want all local models uploaded now:
 
@@ -43,6 +50,25 @@ python -m kaggle_bridge sync-weights
 The first real job also uploads its selected model automatically, so this is
 optional.  Updated model files are detected by size/mtime and a new weights
 dataset version is created.
+
+### Fast session mode
+
+Enabled by default (`KAGGLE_USE_SESSION_DATASET=true`):
+
+1. Dataset load / Kaggle checkbox -> the **whole current images folder** is
+   packed and uploaded once as a private session dataset.  This runs in the
+   background; the UI shows `Kaggle: uploading session images...`.
+2. Every Predict/SAM 2 click writes only a tiny command (selected boxes,
+   range, classes, current labels) into a new version of the fixed kernel.
+   No images and no separate command dataset are uploaded.
+3. The fixed kernel `labelimg-plus-runner` is reused; each click creates a
+   new version (visible in Kaggle, no kernel spam).
+4. On app close, the session dataset is deleted from Kaggle.  The weights
+   dataset and the fixed kernel remain.  If a job is still running, the app
+   waits up to 10 minutes before closing/cleaning.
+
+SAM 2 is installed from a prebuilt local wheel shipped inside the session
+dataset, so the old 4-5 minute git build is gone (~15 s instead).
 
 The local Predict button and local Dynamic SAM 2 are unchanged.  Cloud mode is
 opt-in and can be turned off at any time.
@@ -117,16 +143,18 @@ KAGGLE_API_TOKEN=your-token-here
 If you downloaded `kaggle.json`, put it at `%USERPROFILE%\.kaggle\kaggle.json`
 and leave the token fields blank.
 
-### 2.3 Upload models once (optional but recommended)
+### 2.3 Build the SAM 2 wheel + upload models once
 
 ```bash
+python -m kaggle_bridge.setup --build-sam2-wheel
 python -m kaggle_bridge sync-weights
 ```
 
-This finds `annotation_helper/models/*.pt` (YOLO) and
-`annotation_helper/sam2_models/*.pt` and uploads them to
-`<username>/labelimg-plus-weights`.  It is safe to run again; unchanged files
-are skipped.
+The wheel is built once into `kaggle_weights/wheels/` and is shipped inside
+every session dataset.  `sync-weights` finds `annotation_helper/models/*.pt`
+(YOLO) and `annotation_helper/sam2_models/*.pt` and uploads them to
+`<username>/labelimg-plus-weights`.  Both commands are safe to run again;
+unchanged files are skipped.
 
 ### 2.4 Verify
 
@@ -160,23 +188,26 @@ button for interrupted jobs.
 
 ## 3. What gets uploaded
 
-`job.zip` normally contains only:
+In fast session mode the uploads are:
 
 ```
-manifest.json          job id, classes, frame mapping, existing labels
-runner_lib.py          label merge helpers (shared with the kernel)
-images/000000.jpg      sequential JPEG frames
-images/...
+<username>/labelimg-plus-session-...  images + runner_lib.py + SAM2 wheel
+                                      (one per app session, deleted on close)
+<username>/labelimg-plus-weights      YOLO models + SAM 2 checkpoints
+                                      (persistent, uploaded once)
+<username>/labelimg-plus-runner       ONE fixed kernel; new version per click
 ```
 
-The YOLO model / SAM 2 checkpoint is **not** in the job bundle when
-`KAGGLE_USE_WEIGHTS_DATASET=true` (the default).  It lives in the private
-weights dataset and is attached as a second kernel input:
+The per-click command is embedded directly in `runner.py`:
 
 ```
-<username>/labelimg-plus-job-...   per-job images + labels (deleted after success)
-<username>/labelimg-plus-weights   YOLO models + SAM 2 checkpoints (persistent)
+manifest session.json   all image names/order/dimensions
+command (embedded)      selected boxes, range, classes, current labels, model
+images/000000.jpg       only in the session dataset, not per click
 ```
+
+The legacy per-job bundle (`KAGGLE_USE_SESSION_DATASET=false`) still works and
+uses a private job dataset that is deleted after success.
 
 If no SAM 2 checkpoint is available locally, the kernel downloads the official
 Meta checkpoint once per run (~176 MB).  To avoid that, put the checkpoint in
@@ -248,6 +279,12 @@ The helper's **Jobs... -> Resume selected** does the same from the UI.
 | `KAGGLE_USE_WEIGHTS_DATASET` | `true` | Reuse models from the weights dataset instead of uploading them per job. |
 | `KAGGLE_WEIGHTS_DATASET` | `labelimg-plus-weights` | Persistent private weights dataset slug. |
 | `KAGGLE_WEIGHTS_ROOT` | `kaggle_weights` | Local staging folder for weight uploads. |
+| `KAGGLE_USE_SESSION_DATASET` | `true` | Upload the current images folder once per app session. |
+| `KAGGLE_SESSION_DATASET_PREFIX` | `labelimg-plus-session` | Session dataset slug prefix. |
+| `KAGGLE_FIXED_KERNEL` | `true` | Reuse one kernel slug; new version per click. |
+| `KAGGLE_KERNEL_SLUG` | `labelimg-plus-runner` | Fixed kernel slug. |
+| `KAGGLE_MAX_SESSION_GB` | `20` | Refuse a session images upload larger than this. |
+| `KAGGLE_SESSION_KEEP_LOCAL` | `false` | Keep the local session zip after upload. |
 | `KAGGLE_POLL_SECONDS` | `30` | Kernel status poll interval. |
 | `KAGGLE_TIMEOUT_HOURS` | `6` | Give up waiting after this long. |
 | `KAGGLE_ACCELERATOR` | `NvidiaTeslaT4` | Kaggle GPU T4 x2. |
@@ -272,10 +309,16 @@ The helper's **Jobs... -> Resume selected** does the same from the UI.
 - SAM 2 uses one T4 for the predictor.  The second T4 is attached and visible
   (`gpu_count=2` in `result.json`) but the current video predictor is
   single-GPU.  It can be used for future batched/parallel jobs.
-- SAM 2 runs are slower because the ephemeral kernel installs SAM 2 from
-  GitHub each time (~4-5 minutes).  The checkpoint itself is reused from the
-  weights dataset, so no 176 MB download is needed after `sync-weights`.
-  YOLO predict is about 20-30 seconds after the kernel starts.
+- The first session upload can take minutes for a large folder (e.g. 4000
+  frames).  It is done once per app session; every click afterwards sends only
+  a ~0.5-1 KB command.
+- YOLO click: about 20-40 seconds after the kernel starts.
+- SAM 2 click: about 2 minutes, mostly model loading + tracking.  The SAM 2
+  package comes from the local wheel (~15 s instead of a 4-5 minute git build)
+  and the checkpoint is reused from the weights dataset.
+- The fixed kernel keeps one version per click.  Set
+  `KAGGLE_DELETE_KERNEL_AFTER=true` or delete it manually if you do not want
+  version history.
 
 ---
 
@@ -290,6 +333,10 @@ Validated on 2026-11-13 with Kaggle user `dukeshavrao`:
 | YOLO `yolov11l_jul10.pt` with weights reuse | job bundle **0.14 MB** (was 153 MB), 7 boxes returned, 22.9 s kernel, `gpu_count=2` |
 | SAM 2.1 Small, no checkpoint in bundle | job bundle **0.04 MB**, checkpoint reused from weights dataset, 5/5 frames tracked, 318 s (SAM 2 package install time), `gpu_count=2` |
 | SAM 2.1 Small, first run with download | 1 object, 5/5 frames tracked, 5 label files merged, `device=cuda`, `gpu_count=2`, 203.5 s including install/checkpoint |
+| Session mode, first YOLO click | 5 images uploaded once (285 KB), fixed kernel v4, 7 boxes, **578-byte command** |
+| Session mode, second YOLO click | session dataset reused, **no image upload**, fixed kernel v5, 7 boxes |
+| Session mode + SAM2 local wheel | 15.5 s wheel install, 5/5 frames tracked, **121 s total**, `gpu_count=2` |
+| Session cleanup | session dataset deleted from Kaggle; weights + fixed kernel remain |
 | Authentication | `dukeshavrao`, GPU quota 30h remaining |
 | Unit tests | 24 tests pass on Python 3.10 and 3.13 |
 
@@ -308,6 +355,35 @@ bridge uses `labelimg-plus-job-...` for datasets and
 Kaggle auto-extracts uploaded zip files.  The runner supports both an
 extracted dataset root and a real zip.  If you see this on an old build,
 update `kaggle_bridge/kernel_runner.py`.
+
+### Session images upload is slow / too large
+
+The whole current `images/` folder is uploaded once.  For 4000+ frames this
+can be several GB.  The bridge refuses sessions above `KAGGLE_MAX_SESSION_GB`
+(default 20).  Reduce the batch or raise the limit.  The next click reuses the
+session dataset, so the wait is one-time per app session.
+
+### App close waits for a running job
+
+If a Kaggle job is running when LabelImg closes, the app waits up to 10
+minutes for it.  If it is still queued/running after that, the session
+dataset is left for the next launch and a stale-cleanup runs then.  This
+prevents deleting images under a live kernel.
+
+### Session cleanup
+
+```bash
+python -m kaggle_bridge session-cleanup
+python -m kaggle_bridge session-cleanup --stale-hours 24
+```
+
+Only the session image dataset (and any tracked legacy command datasets) is
+deleted.  `<username>/labelimg-plus-weights` and the fixed kernel stay.
+
+### `NameError: null` in the kernel
+
+Older builds embedded JSON (`null`) into Python.  Current builds embed a
+Python literal (`None`); update `kaggle_bridge/session.py`.
 
 ### `ModuleNotFoundError: runner_lib`
 
@@ -372,8 +448,10 @@ worker requests `NvidiaTeslaT4` both in metadata and on the CLI push.
 python -m kaggle_bridge.doctor
 python -m kaggle_bridge.setup --create-venv
 python -m kaggle_bridge.setup --write-env
+python -m kaggle_bridge.setup --build-sam2-wheel
 python -m kaggle_bridge sync-weights
 python -m kaggle_bridge jobs
+python -m kaggle_bridge session-cleanup
 python -m kaggle_bridge status --job <job-id> --log
 python -m kaggle_bridge resume --job <job-id>
 python -m kaggle_bridge import --job <job-id>
@@ -408,8 +486,14 @@ in section 7.
 - There is no remote-cancel button yet; deleting the kernel on Kaggle stops it.
 - Long videos are not automatically chunked.  Split very long clips or use a
   frame range; SAM 2 memory resets per kernel job.
-- The first SAM 2 run still pays the SAM 2 package install time.  The checkpoint
-  itself is reused from the weights dataset when `sync-weights` was run.
+- The first session upload copies/compresses the whole current images folder.
+  Large batches take time and local disk; this is one-time per app session.
+- The fixed kernel keeps one version per click; old versions remain in Kaggle
+  history.  Delete the kernel manually to reset the history.
+- If LabelImg is force-killed, the detached `session-cleanup` may not run.
+  Reopening the same batch reuses the session (and deletes it on a normal
+  close), or run `python -m kaggle_bridge session-cleanup --stale-hours 24`
+  manually.
 - When a new model/checkpoint is added, the weights dataset version re-uploads
   the staged weight files (Kaggle datasets are snapshots).  Updates are
   detected by size/mtime.

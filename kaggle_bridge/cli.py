@@ -27,6 +27,8 @@ from .config import Config, ConfigError, load_config
 from .doctor import run_doctor
 from .importer import import_job_output
 from .jobstore import JobStore
+from .kaggle_cli import KaggleCLI
+from .session import RemoteSession
 from .spec import JobSpec, SpecError
 from .weights import sync_weights
 from .worker import KaggleJobError, KaggleJobRunner
@@ -95,7 +97,9 @@ def cmd_status(args) -> int:
     print(f"Created:    {record.get('created_at')}")
     print(f"Updated:    {record.get('updated_at')}")
     print(f"Dataset:    {record.get('dataset_ref')}")
+    print(f"Session:    {record.get('session_dataset')}")
     print(f"Kernel:     {record.get('kernel_ref')}")
+    print(f"Kernel run: {record.get('kernel_run_ref')}")
     print(f"Message:    {record.get('message')}")
     if record.get("error"):
         print("Error:")
@@ -229,6 +233,25 @@ def cmd_doctor(args) -> int:
     return run_doctor(load_config(), check_auth=not args.no_auth)
 
 
+def cmd_session_cleanup(args) -> int:
+    cfg = load_config()
+    log = None if args.quiet else print
+    try:
+        cli = KaggleCLI(cfg, log=log)
+        session = RemoteSession(cfg, cli, log=log)
+        changed = session.cleanup(
+            force=args.stale_hours is None,
+            stale_hours=args.stale_hours,
+        )
+    except Exception as exc:
+        if not args.quiet:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        print("Kaggle session cleaned." if changed else "No session to clean.")
+    return 0
+
+
 def cmd_sync_weights(args) -> int:
     cfg = load_config()
     try:
@@ -261,6 +284,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--username", default="", help="Kaggle username (auto-detected)")
     p.set_defaults(func=cmd_sync_weights)
+
+    p = sub.add_parser(
+        "session-cleanup",
+        help="Delete this app session's image dataset from Kaggle",
+    )
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument(
+        "--stale-hours",
+        type=float,
+        default=None,
+        help="Only clean sessions older than this many hours",
+    )
+    p.set_defaults(func=cmd_session_cleanup)
 
     p = sub.add_parser("jobs", help="List local jobs")
     p.add_argument("--limit", type=int, default=100)

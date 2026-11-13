@@ -28,9 +28,14 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# ``runner_lib`` is shipped inside job.zip and imported after extraction in
-# main().  Kaggle script kernels do not upload sibling files from the kernel
-# folder, so importing it at module import time would fail in the cloud.
+# The local worker replaces this line with the actual per-click command when
+# using the fast session dataset.  Legacy jobs leave it as None and carry a
+# manifest inside job.zip instead.
+EMBEDDED_COMMAND = None  # KAGGLE_BRIDGE_COMMAND
+
+# ``runner_lib`` is shipped inside the session/job dataset and imported after
+# extraction in main().  Kaggle script kernels do not upload sibling files
+# from the kernel folder, so importing it at module import time would fail.
 merge_tracked_labels = None
 normalize_label_lines = None
 parse_label_parts = None
@@ -77,6 +82,87 @@ def write_status(stage: str, percent: int, message: str, **extra: Any) -> None:
 # ----------------------------------------------------------------------
 # Input / dependency setup
 # ----------------------------------------------------------------------
+def _link_or_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(str(source), str(destination))
+    except OSError:
+        shutil.copyfile(source, destination)
+
+
+def find_session_input():
+    """Find the extracted session dataset (session.json + images/)."""
+    explicit = os.environ.get("LABELIMG_SESSION_DIR")
+    if explicit and (Path(explicit) / "session.json").is_file():
+        return Path(explicit)
+    manifests = sorted(glob.glob("/kaggle/input/**/session.json", recursive=True))
+    if manifests:
+        return Path(manifests[0]).parent
+    archives = sorted(glob.glob("/kaggle/input/**/session.zip", recursive=True))
+    if archives:
+        if JOB_DIR.exists():
+            shutil.rmtree(JOB_DIR)
+        safe_extract(Path(archives[0]), JOB_DIR)
+        return JOB_DIR
+    raise FileNotFoundError(
+        "session.json/session.zip not found under /kaggle/input. "
+        "Check that the session dataset is attached to the kernel."
+    )
+
+
+def build_manifest_from_session(session_root: Path, command: Dict[str, Any]) -> Dict[str, Any]:
+    with open(session_root / "session.json", "r", encoding="utf-8") as handle:
+        session = json.load(handle)
+    if not isinstance(session, dict) or not isinstance(session.get("images"), list):
+        raise RuntimeError("session.json is invalid")
+    params = command.get("params") or {}
+    indices = params.get("indices")
+    all_images = session["images"]
+    if indices is None:
+        selected = list(all_images)
+    else:
+        selected = []
+        for index in indices:
+            try:
+                selected.append(all_images[int(index)])
+            except (IndexError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"invalid image index in command: {index!r}") from exc
+
+    if session_root.resolve() != JOB_DIR.resolve():
+        if JOB_DIR.exists():
+            shutil.rmtree(JOB_DIR)
+        JOB_DIR.mkdir(parents=True, exist_ok=True)
+        for entry in selected:
+            relative = str(entry.get("file") or "")
+            if not relative:
+                raise RuntimeError("session image entry has no file")
+            source = (session_root / relative).resolve()
+            try:
+                source.relative_to(session_root.resolve())
+            except ValueError as exc:
+                raise RuntimeError(f"session image escapes root: {relative!r}") from exc
+            if not source.is_file():
+                raise FileNotFoundError(f"session image missing: {source}")
+            _link_or_copy(source, JOB_DIR / relative)
+    # runner_lib.py lives in the session dataset.
+    lib_source = session_root / "runner_lib.py"
+    if lib_source.is_file() and not (JOB_DIR / "runner_lib.py").is_file():
+        shutil.copyfile(lib_source, JOB_DIR / "runner_lib.py")
+
+    manifest = {
+        "schema": 1,
+        "job_id": command.get("job_id") or "unknown",
+        "type": command.get("type") or "yolo_predict",
+        "classes": command.get("classes") or [],
+        "images": selected,
+        "labels": command.get("labels") or {},
+        "model": command.get("model") or {},
+        "params": params,
+    }
+    write_json(JOB_DIR / "manifest.json", manifest)
+    return manifest
+
+
 def find_job_input():
     """Return ``(path, kind)`` where kind is ``"zip"`` or ``"dir"``.
 
@@ -179,6 +265,26 @@ def ensure_sam2() -> None:
     except Exception:
         pass
 
+    # The session dataset carries a prebuilt SAM 2 wheel.  This avoids the
+    # slow git clone + build that used to cost ~4-5 minutes per kernel.
+    wheels = sorted(glob.glob("/kaggle/input/**/sam_2*.whl", recursive=True))
+    wheels += sorted(glob.glob("/kaggle/input/**/sam2*.whl", recursive=True))
+    # Fallback when the session zip was extracted into JOB_DIR instead of
+    # being auto-extracted by Kaggle.
+    wheels += sorted(glob.glob(str(JOB_DIR / "**" / "sam_2*.whl"), recursive=True))
+    wheels += sorted(glob.glob(str(JOB_DIR / "**" / "sam2*.whl"), recursive=True))
+    if wheels:
+        wheel = wheels[0]
+        log(f"Installing SAM 2 from local wheel: {wheel}")
+        try:
+            pip_install(["--no-deps", wheel], timeout=600)
+            pip_install(["hydra-core", "iopath"], timeout=900)
+            import sam2  # noqa: F401
+            log("SAM 2 installed from local wheel.")
+            return
+        except Exception as exc:
+            log(f"Local SAM 2 wheel failed ({exc}); falling back to GitHub.")
+
     pip_install(["hydra-core", "iopath"], timeout=900)
     env = os.environ.copy()
     env["SAM2_BUILD_CUDA"] = "0"
@@ -253,9 +359,12 @@ def load_manifest(job_dir: Path) -> Dict[str, Any]:
             raise RuntimeError("manifest image entry is missing name/file")
         if "/" in name or "\\" in name:
             raise RuntimeError(f"Unsafe image name: {name!r}")
-        target = (job_dir / rel).resolve()
+        # Do not resolve symlinks here: session images are symlinked from
+        # /kaggle/input to /tmp to avoid copying multi-GB image sets.  Use the
+        # link path for the containment check and let is_file() follow it.
+        target = Path(os.path.abspath(str(job_dir / rel)))
         try:
-            target.relative_to(job_dir.resolve())
+            target.relative_to(Path(os.path.abspath(str(job_dir))))
         except ValueError as exc:
             raise RuntimeError(f"Image path escapes job dir: {rel!r}") from exc
         if not target.is_file():
@@ -681,16 +790,22 @@ def main() -> int:
     global merge_tracked_labels, normalize_label_lines, parse_label_parts, remap_class_by_name
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     write_status("start", 1, "Preparing job")
-    job_input, kind = find_job_input()
-    log(f"Job input ({kind}): {job_input}")
-    if JOB_DIR.exists():
-        shutil.rmtree(JOB_DIR)
-    if kind == "zip":
-        safe_extract(job_input, JOB_DIR)
+    if EMBEDDED_COMMAND is not None:
+        write_status("session", 2, "Preparing session images")
+        session_root = find_session_input()
+        log(f"Session input: {session_root}")
+        build_manifest_from_session(session_root, EMBEDDED_COMMAND)
     else:
-        shutil.copytree(job_input, JOB_DIR)
+        job_input, kind = find_job_input()
+        log(f"Job input ({kind}): {job_input}")
+        if JOB_DIR.exists():
+            shutil.rmtree(JOB_DIR)
+        if kind == "zip":
+            safe_extract(job_input, JOB_DIR)
+        else:
+            shutil.copytree(job_input, JOB_DIR)
     sys.path.insert(0, str(JOB_DIR))
-    import runner_lib  # supplied inside job.zip
+    import runner_lib  # supplied inside the session/job dataset
 
     merge_tracked_labels = runner_lib.merge_tracked_labels
     normalize_label_lines = runner_lib.normalize_label_lines

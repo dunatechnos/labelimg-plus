@@ -70,6 +70,12 @@ KAGGLE_JOB_ROOT=kaggle_jobs
 KAGGLE_USE_WEIGHTS_DATASET=true
 KAGGLE_WEIGHTS_DATASET=labelimg-plus-weights
 KAGGLE_WEIGHTS_ROOT=kaggle_weights
+KAGGLE_USE_SESSION_DATASET=true
+KAGGLE_SESSION_DATASET_PREFIX=labelimg-plus-session
+KAGGLE_FIXED_KERNEL=true
+KAGGLE_KERNEL_SLUG=labelimg-plus-runner
+KAGGLE_MAX_SESSION_GB=20
+KAGGLE_SESSION_KEEP_LOCAL=false
 KAGGLE_POLL_SECONDS={poll_seconds}
 KAGGLE_TIMEOUT_HOURS={timeout_hours}
 KAGGLE_ACCELERATOR={accelerator}
@@ -88,6 +94,12 @@ def default_env_values() -> Dict[str, str]:
         "KAGGLE_USE_WEIGHTS_DATASET": "true",
         "KAGGLE_WEIGHTS_DATASET": "labelimg-plus-weights",
         "KAGGLE_WEIGHTS_ROOT": "kaggle_weights",
+        "KAGGLE_USE_SESSION_DATASET": "true",
+        "KAGGLE_SESSION_DATASET_PREFIX": "labelimg-plus-session",
+        "KAGGLE_FIXED_KERNEL": "true",
+        "KAGGLE_KERNEL_SLUG": "labelimg-plus-runner",
+        "KAGGLE_MAX_SESSION_GB": "20",
+        "KAGGLE_SESSION_KEEP_LOCAL": "false",
         "KAGGLE_POLL_SECONDS": str(DEFAULT_POLL_SECONDS),
         "KAGGLE_TIMEOUT_HOURS": str(DEFAULT_TIMEOUT_HOURS),
         "KAGGLE_ACCELERATOR": DEFAULT_ACCELERATOR,
@@ -160,6 +172,63 @@ def _run(
             f"Command failed with exit code {proc.returncode}: {' '.join(cmd)}"
         )
     return proc
+
+
+def build_sam2_wheel(
+    cfg: Config,
+    force: bool = False,
+    log: Callable[[str], None] = print,
+) -> Path:
+    """Build the SAM 2 wheel once (avoids a 4-5 minute git build per kernel)."""
+    wheels = Path(cfg.weights_root) / "wheels"
+    wheels.mkdir(parents=True, exist_ok=True)
+    existing = sorted(wheels.glob("sam_2*.whl")) + sorted(wheels.glob("sam2*.whl"))
+    if existing and not force:
+        log(f"SAM 2 wheel already exists: {existing[0]}")
+        return existing[0]
+    python = cfg.find_python_311()
+    if not python:
+        raise ConfigError(
+            "No Python 3.11+ interpreter found to build the SAM 2 wheel. "
+            "Set KAGGLE_PYTHON or install Python 3.11+."
+        )
+    log("Building SAM 2 wheel once (CUDA extension disabled)...")
+    env = os.environ.copy()
+    env["SAM2_BUILD_CUDA"] = "0"
+    cmd = [
+        python,
+        "-m",
+        "pip",
+        "wheel",
+        "--no-deps",
+        "git+https://github.com/facebookresearch/sam2.git",
+        "-w",
+        str(wheels),
+    ]
+    log("$ " + " ".join(cmd))
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=1800,
+        env=env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if proc.stdout:
+        for line in (proc.stdout or "").splitlines()[-15:]:
+            log("  " + line)
+    if proc.stderr:
+        for line in (proc.stderr or "").splitlines()[-15:]:
+            log("  " + line)
+    if proc.returncode != 0:
+        raise ConfigError("Failed to build the SAM 2 wheel; see output above.")
+    found = sorted(wheels.glob("sam_2*.whl")) + sorted(wheels.glob("sam2*.whl"))
+    if not found:
+        raise ConfigError("SAM 2 wheel build finished but no wheel was found.")
+    log(f"SAM 2 wheel ready: {found[0]}")
+    return found[0]
 
 
 def create_venv(
@@ -262,6 +331,11 @@ def main(argv=None) -> int:
         help="Create .env from the template if missing",
     )
     parser.add_argument(
+        "--build-sam2-wheel",
+        action="store_true",
+        help="Build the SAM 2 local wheel once (fast kernel installs)",
+    )
+    parser.add_argument(
         "--upload-weights",
         action="store_true",
         help="Upload all local YOLO models + SAM 2 checkpoints once",
@@ -306,6 +380,9 @@ def main(argv=None) -> int:
             create_venv(cfg, force=args.force)
             cfg = load_config()
 
+        if args.build_sam2_wheel:
+            build_sam2_wheel(cfg, force=args.force, log=print)
+
         if args.upload_weights:
             from .weights import sync_weights
 
@@ -316,6 +393,7 @@ def main(argv=None) -> int:
             args.create_venv
             or args.write_env
             or updates
+            or args.build_sam2_wheel
             or args.upload_weights
         ):
             from .doctor import run_doctor
