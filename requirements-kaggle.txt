@@ -1,0 +1,9 @@
+# Kaggle CLI for the optional cloud offload.
+# Requires Python 3.11+.  Do NOT install this into a Python 3.10 labelImg
+# environment.  Use:
+#
+#     python -m kaggle_bridge.setup --create-venv
+#
+kaggle>=2.2,<3
+# kaggle 2.2.5 imports six in models/upload_file.py but does not declare it.
+six>=1.16

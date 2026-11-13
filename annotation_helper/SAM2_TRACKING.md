@@ -136,3 +136,20 @@ is usable. For CPU-only deployment, 16 GB RAM is recommended; install a CPU
 PyTorch wheel if the machine has no CUDA, then install SAM 2 with
 `SAM2_BUILD_CUDA=0`.
 
+## Cloud mode: Kaggle T4 x2
+
+The same Dynamic SAM 2 action can run on Kaggle's 2x T4 GPUs.  This is
+optional and does not change local mode.
+
+1. Set up the Kaggle token/CLI once (see
+   [KAGGLE_SAM2.md](KAGGLE_SAM2.md)).
+2. In Annotation Helper, tick **Run heavy work on Kaggle (T4 x2)**.
+3. Select the boxes and choose **Propagate > Dynamic SAM 2**.
+4. Click **Start SAM 2 on Kaggle**.
+
+The helper uploads the frames + current labels, runs SAM 2 on a private T4 x2
+kernel, downloads the changed labels and merges them locally.  `Ctrl+Z` undoes
+the import.  The first cloud run takes ~3–4 minutes because the kernel installs
+SAM 2 and downloads the checkpoint; later jobs reuse the same pipeline.  See
+[KAGGLE_SAM2.md](KAGGLE_SAM2.md) for quotas, logs, resume and troubleshooting.
+

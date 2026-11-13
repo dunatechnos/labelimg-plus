@@ -34,6 +34,38 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QImage, QPixmap, QPen, QColor, QKeySequence, QFont
 from PyQt5.QtCore import Qt, QRectF, QPointF, QThread, pyqtSignal
 
+# ---------------------------------------------------------------------------
+# Optional Kaggle cloud offload.  The bridge runs on Python 3.10 too; the
+# Kaggle CLI itself is installed separately in .kaggle-venv.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+KAGGLE_UI_AVAILABLE = False
+KAGGLE_UI_ERROR = ""
+try:
+    from annotation_helper.kaggle_ui import (
+        KaggleJobThread,
+        KaggleJobsDialog,
+        KaggleSettingsDialog,
+    )
+    from kaggle_bridge.config import load_config
+
+    KAGGLE_UI_AVAILABLE = True
+except Exception as _kaggle_import_error:
+    try:
+        from kaggle_ui import (  # type: ignore
+            KaggleJobThread,
+            KaggleJobsDialog,
+            KaggleSettingsDialog,
+        )
+        from kaggle_bridge.config import load_config
+
+        KAGGLE_UI_AVAILABLE = True
+    except Exception:
+        KAGGLE_UI_ERROR = str(_kaggle_import_error)
+
 # ultralytics YOLO (ensure installed)
 try:
     from ultralytics import YOLO
@@ -868,6 +900,7 @@ class AnnotationApp(QWidget):
         self.active_model = None
         self.custom_target_indices = None    # <-- ADD THIS HERE
         self.sam2_thread = None
+        self.kaggle_thread = None
 
 
         self.current_index = 1 if self.images else 0
@@ -888,6 +921,7 @@ class AnnotationApp(QWidget):
         self.build_ui()
         self.on_action_changed("delete")
         self.update_sam2_model_label()
+        self.refresh_kaggle_status()
 
         # keyboard shortcuts
         self.setup_shortcuts()
@@ -1171,6 +1205,40 @@ class AnnotationApp(QWidget):
         model_v.addWidget(self.progress_bar)
 
         left_layout.addWidget(model_group)
+
+        # --- Compute Group (optional Kaggle T4 x2 offload) ---
+        compute_group = QGroupBox("Compute")
+        compute_group.setObjectName("cardGroup")
+        compute_v = QVBoxLayout(compute_group)
+        compute_v.setSpacing(7)
+
+        self.chk_kaggle = QCheckBox("Run heavy work on Kaggle (T4 x2)")
+        self.chk_kaggle.setToolTip(
+            "Predict and Dynamic SAM 2 are packed, uploaded to Kaggle, run on "
+            "2x T4 GPU, and merged back into this dataset with Undo support."
+        )
+        self.chk_kaggle.toggled.connect(self.on_kaggle_toggled)
+        compute_v.addWidget(self.chk_kaggle)
+
+        self.kaggle_status = QLabel("Kaggle: checking...")
+        self.kaggle_status.setObjectName("statusLabel")
+        self.kaggle_status.setWordWrap(True)
+        compute_v.addWidget(self.kaggle_status)
+
+        kaggle_row = QHBoxLayout()
+        kaggle_row.setSpacing(6)
+        self.btn_kaggle_setup = QPushButton("Kaggle setup")
+        self.btn_kaggle_setup.setObjectName("secondaryButton")
+        self.btn_kaggle_setup.clicked.connect(self.open_kaggle_settings)
+        kaggle_row.addWidget(self.btn_kaggle_setup)
+
+        self.btn_kaggle_jobs = QPushButton("Jobs...")
+        self.btn_kaggle_jobs.setObjectName("secondaryButton")
+        self.btn_kaggle_jobs.clicked.connect(self.open_kaggle_jobs)
+        kaggle_row.addWidget(self.btn_kaggle_jobs)
+        compute_v.addLayout(kaggle_row)
+
+        left_layout.addWidget(compute_group)
 
         # --- Selected boxes list (kept small) ---
         sel_group = QGroupBox("Selected Boxes")
@@ -1755,8 +1823,11 @@ class AnnotationApp(QWidget):
             )
 
     def update_apply_button_text(self):
+        remote = bool(getattr(self, "chk_kaggle", None) and self.chk_kaggle.isChecked())
         if self.radio_propagate.isChecked() and self.radio_prop_sam2.isChecked():
-            self.btn_apply.setText("Start SAM 2 Tracking")
+            self.btn_apply.setText(
+                "Start SAM 2 on Kaggle" if remote else "Start SAM 2 Tracking"
+            )
         else:
             self.btn_apply.setText("Apply Action")
 
@@ -1764,6 +1835,9 @@ class AnnotationApp(QWidget):
     def on_apply_action(self):
         if self.sam2_thread is not None and self.sam2_thread.isRunning():
             self.label_status.setText("SAM 2 tracking is already running.")
+            return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is already running. Wait for it to finish.")
             return
         act = self.get_current_action()
         start_idx = self.current_index
@@ -2008,9 +2082,15 @@ class AnnotationApp(QWidget):
         if self.sam2_thread is not None and self.sam2_thread.isRunning():
             self.label_status.setText("SAM 2 tracking is already running.")
             return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is already running. Wait for it to finish.")
+            return
         predict_thread = getattr(self, "predict_thread", None)
         if predict_thread is not None and predict_thread.isRunning():
             self.label_status.setText("YOLO prediction is running. Wait for it to finish.")
+            return
+        if getattr(self, "chk_kaggle", None) is not None and self.chk_kaggle.isChecked():
+            self.start_kaggle_sam2()
             return
 
         selected = [list(it.parts) for it in self.bbox_items if it.isSelected()]
@@ -2106,8 +2186,12 @@ class AnnotationApp(QWidget):
             self.combo_sam2_model,
             self.spin_sam2_conf,
             self.btn_sam2_download,
+            self.btn_kaggle_setup,
+            self.btn_kaggle_jobs,
         ):
             widget.setEnabled(enabled)
+        if hasattr(self, "chk_kaggle"):
+            self.chk_kaggle.setEnabled(enabled and KAGGLE_UI_AVAILABLE)
         self.update_apply_button_text()
 
     def on_sam2_done(self, message):
@@ -2139,6 +2223,12 @@ class AnnotationApp(QWidget):
     def update_sam2_model_label(self):
         """Show whether the selected SAM 2 model is ready or needs downloading."""
         try:
+            if getattr(self, "chk_kaggle", None) is not None and self.chk_kaggle.isChecked():
+                self.sam2_model_status.setText(
+                    "SAM 2 model: handled by Kaggle T4 x2 (no local download needed)"
+                )
+                self.btn_sam2_download.setVisible(False)
+                return
             key = self.sam2_selected_model_key()
             info = SAM2_MODELS[key]
             if sam2_checkpoint_available(key):
@@ -2214,6 +2304,12 @@ class AnnotationApp(QWidget):
         if self.sam2_thread is not None and self.sam2_thread.isRunning():
             self.label_status.setText("SAM 2 tracking is running. Wait for it to finish.")
             return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is already running. Wait for it to finish.")
+            return
+        if getattr(self, "chk_kaggle", None) is not None and self.chk_kaggle.isChecked():
+            self.start_kaggle_predict()
+            return
         model_name = self.combo_models.currentText()
         if not model_name or model_name == "(no models found)":
             self.label_status.setText("No model selected.")
@@ -2276,6 +2372,300 @@ class AnnotationApp(QWidget):
         self.update_apply_button_text()
         self.label_status.setText("Predict error. See console.")
         print(msg)
+
+    # ---------------- Kaggle T4 x2 offload ----------------
+    def _kaggle_blockers(self):
+        if not KAGGLE_UI_AVAILABLE:
+            return None, [KAGGLE_UI_ERROR or "Kaggle bridge is not importable."]
+        try:
+            cfg = load_config()
+        except Exception as exc:
+            return None, [f"Cannot load .env: {exc}"]
+        blockers = []
+        if cfg.find_cli() is None:
+            blockers.append(
+                "Kaggle CLI not installed. Click 'Kaggle setup' and install it."
+            )
+        if cfg.credentials_source() is None:
+            blockers.append(
+                "Kaggle credentials missing. Put kaggle.json in "
+                f"{cfg.kaggle_home} or paste a token in 'Kaggle setup'."
+            )
+        return cfg, blockers
+
+    def refresh_kaggle_status(self):
+        if not hasattr(self, "kaggle_status"):
+            return
+        if not KAGGLE_UI_AVAILABLE:
+            self.kaggle_status.setText("Kaggle: bridge unavailable")
+            self.kaggle_status.setToolTip(KAGGLE_UI_ERROR)
+            if hasattr(self, "chk_kaggle"):
+                self.chk_kaggle.setEnabled(False)
+            if hasattr(self, "btn_kaggle_setup"):
+                self.btn_kaggle_setup.setEnabled(False)
+            if hasattr(self, "btn_kaggle_jobs"):
+                self.btn_kaggle_jobs.setEnabled(False)
+            return
+        _cfg, blockers = self._kaggle_blockers()
+        if not blockers:
+            self.kaggle_status.setText("Kaggle: ready for T4 x2 jobs")
+            self.kaggle_status.setToolTip(
+                "Tick the checkbox, then use Predict or Dynamic SAM 2. "
+                "Results download and merge automatically."
+            )
+        else:
+            self.kaggle_status.setText("Kaggle: setup needed")
+            self.kaggle_status.setToolTip("\n".join(blockers))
+        if hasattr(self, "chk_kaggle") and not self.chk_kaggle.isChecked():
+            self.chk_kaggle.setEnabled(True)
+
+    def on_kaggle_toggled(self, checked):
+        if checked and not KAGGLE_UI_AVAILABLE:
+            self.chk_kaggle.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "Kaggle unavailable",
+                KAGGLE_UI_ERROR or "The Kaggle bridge could not be imported.",
+            )
+            return
+        self.btn_predict.setText("Predict on Kaggle" if checked else "Predict")
+        self.update_apply_button_text()
+        self.update_sam2_model_label()
+        if checked:
+            self.label_status.setText(
+                "Kaggle mode ON: Predict and Dynamic SAM 2 will run on T4 x2."
+            )
+        else:
+            self.label_status.setText("Kaggle mode OFF: heavy work runs locally.")
+
+    def open_kaggle_settings(self):
+        if not KAGGLE_UI_AVAILABLE:
+            QMessageBox.warning(
+                self, "Kaggle unavailable", KAGGLE_UI_ERROR or "Bridge import failed."
+            )
+            return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is running. Try again when it finishes.")
+            return
+        try:
+            dlg = KaggleSettingsDialog(self)
+            dlg.exec_()
+        except Exception as exc:
+            QMessageBox.critical(self, "Kaggle setup", f"{exc}")
+            print(traceback.format_exc())
+        self.refresh_kaggle_status()
+
+    def open_kaggle_jobs(self):
+        if not KAGGLE_UI_AVAILABLE:
+            QMessageBox.warning(
+                self, "Kaggle unavailable", KAGGLE_UI_ERROR or "Bridge import failed."
+            )
+            return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is running. Wait for it to finish.")
+            return
+        try:
+            dlg = KaggleJobsDialog(self)
+            dlg.resume_requested.connect(self.resume_kaggle_job)
+            dlg.exec_()
+        except Exception as exc:
+            QMessageBox.critical(self, "Kaggle jobs", f"{exc}")
+            print(traceback.format_exc())
+        self.refresh_kaggle_status()
+
+    def resume_kaggle_job(self, job_id):
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is already running.")
+            return
+        try:
+            thread = KaggleJobThread(job_id=job_id, resume=True, parent=self)
+        except Exception as exc:
+            QMessageBox.critical(self, "Kaggle resume", f"{exc}")
+            return
+        self._wire_kaggle_thread(thread)
+        self._start_kaggle_thread(thread, f"Resuming {job_id}")
+
+    def start_kaggle_predict(self):
+        from kaggle_bridge.spec import JobSpec, SpecError
+
+        model_name = self.combo_models.currentText()
+        if not model_name or model_name == "(no models found)":
+            self.label_status.setText("No model selected.")
+            return
+        images = list_images()
+        if not images:
+            self.label_status.setText("No frames found.")
+            return
+        classes = read_classes()
+        if not classes:
+            self.label_status.setText("classes.txt is empty; cannot map model classes.")
+            return
+        start_idx = max(1, min(int(self.current_index or 1), len(images)))
+        end_idx = max(start_idx, min(int(self.spin_end.value()), len(images)))
+        spec = JobSpec(
+            job_type="yolo_predict",
+            images_dir=IMAGES_DIR,
+            labels_dir=LABELS_DIR,
+            models_dir=MODELS_DIR,
+            images=images,
+            classes=classes,
+            start_index=start_idx,
+            end_index=end_idx,
+            model_path=os.path.join(MODELS_DIR, model_name),
+            selection_area=(
+                self.selection_area if self.chk_area_mode.isChecked() else None
+            ),
+        )
+        try:
+            spec.validate()
+        except SpecError as exc:
+            QMessageBox.warning(self, "Kaggle predict", str(exc))
+            return
+        self._start_kaggle_job(spec, "YOLO predict")
+
+    def start_kaggle_sam2(self):
+        from kaggle_bridge.spec import JobSpec, SpecError
+
+        selected = [list(it.parts) for it in self.bbox_items if it.isSelected()]
+        if not selected:
+            self.sam2_status.setText("Select one or more boxes on the current frame first.")
+            self.label_status.setText("SAM 2: no boxes selected.")
+            return
+        images = list_images()
+        if not images:
+            self.label_status.setText("No frames found.")
+            return
+        classes = read_classes()
+        if not classes:
+            self.label_status.setText("classes.txt is empty; cannot map classes.")
+            return
+        model_key = self.sam2_selected_model_key()
+        checkpoint = (
+            sam2_checkpoint_path(model_key)
+            if sam2_checkpoint_available(model_key)
+            else ""
+        )
+        direction = ["backward", "forward", "entire"][
+            self.combo_sam2_direction.currentIndex()
+        ]
+        start_idx = max(1, min(int(self.current_index or 1), len(images)))
+        end_idx = max(start_idx, min(int(self.spin_end.value()), len(images)))
+        spec = JobSpec(
+            job_type="sam2_track",
+            images_dir=IMAGES_DIR,
+            labels_dir=LABELS_DIR,
+            models_dir=MODELS_DIR,
+            images=images,
+            classes=classes,
+            start_index=start_idx,
+            end_index=end_idx,
+            direction=direction,
+            boxes=selected,
+            min_confidence=self.spin_sam2_conf.value() / 100.0,
+            model_key=model_key,
+            checkpoint_path=checkpoint,
+            sam2_config=SAM2_MODELS[model_key]["config"],
+        )
+        try:
+            spec.validate()
+        except SpecError as exc:
+            QMessageBox.warning(self, "Kaggle SAM 2", str(exc))
+            return
+        self._start_kaggle_job(
+            spec,
+            f"SAM 2 {SAM2_MODELS[model_key]['label'].split(' (')[0]} tracking",
+        )
+
+    def _start_kaggle_job(self, spec, label):
+        cfg, blockers = self._kaggle_blockers()
+        if blockers:
+            answer = QMessageBox.question(
+                self,
+                "Kaggle setup needed",
+                "Kaggle is not ready:\n\n- "
+                + "\n- ".join(blockers)
+                + "\n\nOpen Kaggle setup now?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes:
+                self.open_kaggle_settings()
+            return
+        try:
+            thread = KaggleJobThread(spec=spec, parent=self)
+        except Exception as exc:
+            QMessageBox.critical(self, "Kaggle job", f"{exc}")
+            return
+        self._wire_kaggle_thread(thread)
+        self._start_kaggle_thread(thread, label)
+
+    def _wire_kaggle_thread(self, thread):
+        thread.progress.connect(self.on_kaggle_progress)
+        thread.status.connect(self.on_kaggle_status)
+        thread.snapshot.connect(self.on_kaggle_snapshot)
+        thread.job_created.connect(
+            lambda job_id: self.kaggle_status.setText(f"Kaggle job: {job_id}")
+        )
+        thread.done.connect(self.on_kaggle_done)
+        thread.failed.connect(self.on_kaggle_failed)
+        thread.finished.connect(lambda: self._on_kaggle_thread_finished(thread))
+
+    def _start_kaggle_thread(self, thread, label):
+        self.kaggle_thread = thread
+        self.set_action_controls_enabled(False)
+        self.btn_predict.setText("Running on Kaggle...")
+        self.btn_apply.setText("Running on Kaggle...")
+        self.progress_bar.setValue(0)
+        self.kaggle_status.setText(f"Kaggle: preparing {label}...")
+        self.label_status.setText(
+            f"Kaggle: {label} — packing frames and uploading to T4 x2..."
+        )
+        thread.start()
+
+    def _on_kaggle_thread_finished(self, thread):
+        if self.kaggle_thread is thread:
+            self.kaggle_thread = None
+        if getattr(self, "chk_kaggle", None) is not None:
+            self.chk_kaggle.setEnabled(KAGGLE_UI_AVAILABLE)
+        self.btn_predict.setText(
+            "Predict on Kaggle" if self.chk_kaggle.isChecked() else "Predict"
+        )
+        self.set_action_controls_enabled(True)
+        self.refresh_kaggle_status()
+
+    def on_kaggle_progress(self, value):
+        self.progress_bar.setValue(int(value))
+
+    def on_kaggle_status(self, message):
+        self.kaggle_status.setText(message)
+        self.label_status.setText(message)
+
+    def on_kaggle_snapshot(self, files_snapshot):
+        try:
+            if files_snapshot:
+                self.push_undo_snapshot(files_snapshot)
+        except Exception as exc:
+            print("on_kaggle_snapshot error:", exc)
+
+    def on_kaggle_done(self, message):
+        self.progress_bar.setValue(100)
+        self.set_action_controls_enabled(True)
+        self.load_image(self.current_index)
+        self.kaggle_status.setText("Kaggle: done")
+        self.label_status.setText(message)
+        QMessageBox.information(self, "Kaggle job finished", message)
+
+    def on_kaggle_failed(self, message):
+        self.progress_bar.setValue(0)
+        self.set_action_controls_enabled(True)
+        self.load_image(self.current_index)
+        self.kaggle_status.setText("Kaggle: job failed")
+        self.label_status.setText("Kaggle job failed. See the message.")
+        print(message)
+        short = str(message)
+        if len(short) > 2200:
+            short = short[:2200] + "\n..."
+        QMessageBox.warning(self, "Kaggle job failed", short)
 
     # ---------------- Shortcuts ----------------
     def setup_shortcuts(self):

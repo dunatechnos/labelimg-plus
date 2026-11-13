@@ -32,6 +32,16 @@ It helps with:
 
 ![Annotation Helper Window](assets/annotation_helper-ui.png)
 
+### Optional: Kaggle T4 x2 Offload
+
+Heavy YOLO prediction and Dynamic SAM 2 tracking can run on Kaggle's 2x T4
+GPUs instead of the local machine.  Tick **Run heavy work on Kaggle (T4 x2)**
+in the Annotation Helper, run Predict or SAM 2 as usual, and the changed YOLO
+labels are downloaded and merged back automatically (with Undo).
+
+Setup, quotas, troubleshooting and the full architecture are in
+[annotation_helper/KAGGLE_SAM2.md](annotation_helper/KAGGLE_SAM2.md).
+
 ## ⚠️ Current Format Support
 
 LabelImg Plus currently supports **YOLO format (.txt)** for all annotation operations.
@@ -48,7 +58,10 @@ Support for additional formats is under development and will be available in fut
 labelimg/
 ├── annotation_helper/
 │   ├── models/                         # Place your trained or pretrained PyTorch (.pt) models here
+│   ├── kaggle_ui.py                    # Optional Kaggle T4 x2 UI/threads
+│   ├── KAGGLE_SAM2.md                  # Cloud offload setup + troubleshooting
 │   └── annotation_helper_current.py    # Main Annotation Helper logic and UI
+├── kaggle_bridge/                      # Kaggle job bundling, CLI wrapper, kernel runner
 │
 ├── labelImg.py                         # Main application entry point
 ├── libs/                               # Core LabelImg libraries

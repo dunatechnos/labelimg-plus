@@ -26,3 +26,9 @@ pandas  # tools/label_to_csv.py
 # NAHI karega (PyPI par official package nahi hai). Git installed hona chahiye.
 #     CPU-only:  SAM2_BUILD_CUDA=0 pip install git+https://github.com/facebookresearch/sam2.git --no-deps
 #     GPU:       pip install git+https://github.com/facebookresearch/sam2.git --no-deps
+
+# ---------- Kaggle cloud offload (optional) ----------
+# The Kaggle CLI 2.x needs Python 3.11+ and must NOT be installed into this
+# Python 3.10 environment.  The bridge installs it into .kaggle-venv:
+#     python -m kaggle_bridge.setup --create-venv
+# See annotation_helper/KAGGLE_SAM2.md.
