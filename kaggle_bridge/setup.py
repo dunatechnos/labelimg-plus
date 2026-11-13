@@ -238,6 +238,11 @@ def create_venv(
 
 
 def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(
         description="Set up the Kaggle CLI venv and .env for labelImg Plus"
     )

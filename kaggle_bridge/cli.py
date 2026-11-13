@@ -299,7 +299,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _safe_console() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
 def main(argv=None) -> int:
+    _safe_console()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

@@ -166,6 +166,11 @@ def run_doctor(
 def main(argv=None) -> int:
     import argparse
 
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(description="Check Kaggle bridge setup")
     parser.add_argument(
         "--no-auth",
