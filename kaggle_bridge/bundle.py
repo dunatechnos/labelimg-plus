@@ -181,6 +181,7 @@ def build_bundle(
     max_bundle_mb: float = 4096.0,
     progress: ProgressFn = None,
     log: LogFn = None,
+    model_override: Optional[Dict[str, Any]] = None,
 ) -> BundleInfo:
     """Create ``<job_dir>/job.zip`` and ``<job_dir>/undo.json``."""
     spec.validate()
@@ -279,7 +280,12 @@ def build_bundle(
                 f"Packing frames {position + 1}/{total}...",
             )
 
-    if spec.job_type == "sam2_track":
+    if model_override is not None:
+        # The model/checkpoint lives in the persistent weights dataset; the
+        # job bundle only carries images, labels and this small pointer.
+        model = dict(model_override)
+        _log(log, "Model weights are reused from the Kaggle weights dataset.")
+    elif spec.job_type == "sam2_track":
         model = _checkpoint_copy(spec, bundle_dir, include_sam2_checkpoint, log)
     else:
         model = _yolo_copy(spec, bundle_dir, log)

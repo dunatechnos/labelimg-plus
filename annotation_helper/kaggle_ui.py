@@ -48,6 +48,7 @@ from kaggle_bridge.jobstore import JobBusyError, JobNotFoundError, JobStore
 from kaggle_bridge.kaggle_cli import KaggleCLI, KaggleCliError
 from kaggle_bridge.setup import create_venv
 from kaggle_bridge.spec import JobSpec, SpecError
+from kaggle_bridge.weights import sync_weights
 from kaggle_bridge.worker import KaggleJobError, KaggleJobRunner
 
 
@@ -58,6 +59,7 @@ class KaggleJobThread(QThread):
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
     snapshot = pyqtSignal(dict)
+    changed_files = pyqtSignal(list)
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
     job_created = pyqtSignal(str)
@@ -97,6 +99,7 @@ class KaggleJobThread(QThread):
             else:
                 result = runner.run(spec=self.spec)
             self.job_created.emit(result.job_id)
+            self.changed_files.emit(list(result.changed_names or []))
             self.done.emit(result.message)
         except (KaggleJobError, JobBusyError, ConfigError, SpecError, JobNotFoundError) as exc:
             details = str(exc)
@@ -144,6 +147,21 @@ class KaggleTestThread(QThread):
             self.failed.emit(str(exc))
 
 
+class KaggleWeightsThread(QThread):
+    log = pyqtSignal(str)
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            mapping = sync_weights(load_config(), log=self.log.emit)
+            self.done.emit(
+                f"Ready (uploaded once, now reused): {len(mapping)} weight file(s)."
+            )
+        except Exception as exc:
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+
 # ----------------------------------------------------------------------
 # Settings / setup dialog
 # ----------------------------------------------------------------------
@@ -155,6 +173,7 @@ class KaggleSettingsDialog(QDialog):
         self.cfg: Config = load_config()
         self.setup_thread: Optional[KaggleSetupThread] = None
         self.test_thread: Optional[KaggleTestThread] = None
+        self.weights_thread: Optional[KaggleWeightsThread] = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -167,7 +186,10 @@ class KaggleSettingsDialog(QDialog):
             '<a href="https://www.kaggle.com/settings/api">'
             "kaggle.com/settings/api</a> and save it as "
             "<code>%USERPROFILE%\\.kaggle\\kaggle.json</code>. "
-            "The T4 x2 option needs a phone-verified Kaggle account."
+            "The T4 x2 option needs a phone-verified Kaggle account.<br><br>"
+            "<b>Models upload once:</b> use <i>Sync weights</i> (or the first "
+            "real job). Later jobs send only images + labels and return "
+            "coordinates, which are shown in LabelImg."
         )
         intro.setWordWrap(True)
         intro.setTextInteractionFlags(Qt.TextBrowserInteraction)
@@ -233,6 +255,15 @@ class KaggleSettingsDialog(QDialog):
         self.btn_test.setObjectName("secondaryButton")
         self.btn_test.clicked.connect(self.start_test)
         buttons.addWidget(self.btn_test)
+
+        self.btn_weights = QPushButton("Sync weights")
+        self.btn_weights.setObjectName("secondaryButton")
+        self.btn_weights.setToolTip(
+            "Upload local YOLO models and SAM 2 checkpoints once; later jobs "
+            "send only images and reuse these weights."
+        )
+        self.btn_weights.clicked.connect(self.start_weights)
+        buttons.addWidget(self.btn_weights)
         buttons.addStretch(1)
 
         self.btn_save = QPushButton("Save")
@@ -247,8 +278,8 @@ class KaggleSettingsDialog(QDialog):
 
     # ------------------------------------------------------------------
     def _busy(self, busy: bool) -> None:
-        for widget in (self.btn_venv, self.btn_test, self.btn_save, self.btn_cancel,
-                       self.chk_force):
+        for widget in (self.btn_venv, self.btn_test, self.btn_weights, self.btn_save,
+                       self.btn_cancel, self.chk_force):
             widget.setEnabled(not busy)
 
     def _append(self, text: str) -> None:
@@ -297,6 +328,26 @@ class KaggleSettingsDialog(QDialog):
         self._append(message)
         QMessageBox.warning(self, "Kaggle connection failed", message)
 
+    def start_weights(self) -> None:
+        if self.weights_thread is not None and self.weights_thread.isRunning():
+            return
+        self._append("Syncing local models/checkpoints to Kaggle (one-time)...")
+        self.weights_thread = KaggleWeightsThread(parent=self)
+        self.weights_thread.log.connect(self._append)
+        self.weights_thread.done.connect(self.on_weights_done)
+        self.weights_thread.failed.connect(self.on_weights_failed)
+        self.weights_thread.finished.connect(lambda: self._busy(False))
+        self._busy(True)
+        self.weights_thread.start()
+
+    def on_weights_done(self, message: str) -> None:
+        self._append(message)
+        QMessageBox.information(self, "Kaggle weights", message)
+
+    def on_weights_failed(self, message: str) -> None:
+        self._append(message)
+        QMessageBox.warning(self, "Kaggle weights failed", message)
+
     def save_and_close(self) -> None:
         updates: Dict[str, str] = {}
         username = self.edit_username.text().strip()
@@ -333,6 +384,7 @@ class KaggleSettingsDialog(QDialog):
         running = (
             (self.setup_thread is not None and self.setup_thread.isRunning())
             or (self.test_thread is not None and self.test_thread.isRunning())
+            or (self.weights_thread is not None and self.weights_thread.isRunning())
         )
         if running:
             QMessageBox.information(

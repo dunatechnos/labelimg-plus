@@ -31,6 +31,7 @@ from .metadata import (
     write_json_atomic,
 )
 from .spec import JobSpec
+from .weights import WeightsManager
 
 ProgressFn = Optional[Callable[[int, str], None]]
 StatusFn = Optional[Callable[[str], None]]
@@ -63,6 +64,7 @@ class JobResult:
     snapshot: Dict[str, List[str]] = field(default_factory=dict)
     output_dir: Optional[Path] = None
     result: Dict[str, Any] = field(default_factory=dict)
+    changed_names: List[str] = field(default_factory=list)
 
 
 class KaggleJobRunner:
@@ -155,6 +157,7 @@ class KaggleJobRunner:
             # (409 SaveKernel), so the kernel deliberately gets its own prefix.
             kernel_id = kernel_id_for(username, job_id)
             kernel_ref = kernel_id
+            weights_dataset_id = None
             self._update(
                 job_id,
                 dataset_ref=dataset_id,
@@ -169,13 +172,81 @@ class KaggleJobRunner:
                     return handled
 
             # ----------------------------------------------------------
+            # 0. Reusable model weights (uploaded only once)
+            # ----------------------------------------------------------
+            model_override = None
+            if self.cfg.use_weights_dataset:
+                self._update(
+                    job_id,
+                    state="bundling",
+                    progress=2,
+                    message="Checking reusable model weights on Kaggle...",
+                    error=None,
+                )
+                manager = WeightsManager(
+                    self.cfg,
+                    cli,
+                    log=lambda msg: self._log(msg, job_id),
+                )
+                weights_dataset_id = manager.dataset_id(username)
+                if spec.job_type == "yolo_predict":
+                    remote_name = manager.ensure_file(Path(spec.model_path), username)
+                    model_override = {
+                        "kind": "yolo",
+                        "source": "weights",
+                        "weights_file": remote_name,
+                        "weights_dataset": weights_dataset_id,
+                    }
+                else:
+                    info = spec.model_info()
+                    if (
+                        self.cfg.include_sam2_checkpoint
+                        and spec.checkpoint_path
+                        and Path(spec.checkpoint_path).is_file()
+                    ):
+                        remote_name = manager.ensure_file(
+                            Path(spec.checkpoint_path), username
+                        )
+                        model_override = {
+                            "kind": "sam2",
+                            "source": "weights",
+                            "model_key": spec.model_key,
+                            "weights_file": remote_name,
+                            "weights_dataset": weights_dataset_id,
+                            "config": info["config"],
+                            "checkpoint_included": False,
+                        }
+                    else:
+                        model_override = {
+                            "kind": "sam2",
+                            "source": "url",
+                            "model_key": spec.model_key,
+                            "file": None,
+                            "config": info["config"],
+                            "checkpoint_url": info["url"],
+                            "checkpoint_included": False,
+                        }
+                self._update(
+                    job_id,
+                    weights_dataset=weights_dataset_id,
+                    message=(
+                        "Model weights ready on Kaggle; only images/labels "
+                        "will be uploaded for this job."
+                    ),
+                )
+
+            # ----------------------------------------------------------
             # 1. Bundle
             # ----------------------------------------------------------
             self._update(
                 job_id,
                 state="bundling",
                 progress=2,
-                message="Packing frames, labels and model...",
+                message=(
+                    "Packing frames and labels (model reused)..."
+                    if model_override is not None
+                    else "Packing frames, labels and model..."
+                ),
                 error=None,
             )
             bundle = build_bundle(
@@ -186,6 +257,7 @@ class KaggleJobRunner:
                 max_bundle_mb=self.cfg.max_bundle_mb,
                 progress=lambda pct, msg: self._progress(pct, msg),
                 log=lambda msg: self._log(msg, job_id),
+                model_override=model_override,
             )
             self._update(
                 job_id,
@@ -211,12 +283,31 @@ class KaggleJobRunner:
                 ),
             )
             dataset_dir = self._prepare_dataset_folder(job_id, bundle, dataset_id)
+            record = self.store.load(job_id)
+            dataset_created = bool(record.get("dataset_created"))
             try:
-                if cli.dataset_exists(dataset_id):
-                    self._log(f"Dataset exists; creating a new version: {dataset_id}", job_id)
+                if dataset_created:
+                    self._log(
+                        f"Dataset flag set; creating a new version: {dataset_id}",
+                        job_id,
+                    )
                     cli.dataset_version(dataset_dir, f"Job {job_id} retry")
                 else:
-                    cli.dataset_create(dataset_dir)
+                    try:
+                        cli.dataset_create(dataset_dir)
+                        self._update(job_id, dataset_created=True)
+                    except KaggleCliError as exc:
+                        message = str(exc).lower()
+                        if "already in use" not in message and "already exists" not in message:
+                            raise
+                        # A previous attempt created the dataset but crashed
+                        # before persisting the flag.  Update it instead.
+                        self._log(
+                            f"Dataset already exists; creating a version: {dataset_id}",
+                            job_id,
+                        )
+                        cli.dataset_version(dataset_dir, f"Job {job_id} retry")
+                        self._update(job_id, dataset_created=True)
                 self._update(
                     job_id,
                     state="waiting_dataset",
@@ -239,7 +330,12 @@ class KaggleJobRunner:
                 progress=60,
                 message="Pushing Kaggle kernel (T4 x2)...",
             )
-            kernel_dir = self._prepare_kernel_folder(job_id, dataset_id, kernel_id)
+            kernel_dir = self._prepare_kernel_folder(
+                job_id,
+                dataset_id,
+                kernel_id,
+                extra_dataset_sources=[weights_dataset_id] if weights_dataset_id else [],
+            )
             push_result = cli.kernels_push(
                 kernel_dir, accelerator=self.cfg.accelerator
             )
@@ -322,6 +418,7 @@ class KaggleJobRunner:
                 message=str(record.get("message") or "Job already done."),
                 output_dir=output_dir if has_output else None,
                 result=(stats.get("kernel_result") or {}),
+                changed_names=list(stats.get("changed_names") or []),
             )
         if state in ("importing", "downloading") and has_output:
             self._log("Resuming at local import.", job_id)
@@ -374,7 +471,11 @@ class KaggleJobRunner:
         return dataset_dir
 
     def _prepare_kernel_folder(
-        self, job_id: str, dataset_id: str, kernel_id: str
+        self,
+        job_id: str,
+        dataset_id: str,
+        kernel_id: str,
+        extra_dataset_sources: Optional[List[str]] = None,
     ) -> Path:
         kernel_dir = self.store.kernel_dir(job_id)
         shutil.rmtree(kernel_dir, ignore_errors=True)
@@ -391,6 +492,7 @@ class KaggleJobRunner:
                 dataset_id,
                 code_file="runner.py",
                 accelerator=self.cfg.accelerator,
+                extra_dataset_sources=extra_dataset_sources,
             ),
         )
         return kernel_dir
@@ -508,6 +610,7 @@ class KaggleJobRunner:
         stats = {
             "changed": imported.changed,
             "boxes": imported.boxes,
+            "changed_names": imported.changed_names,
             "kernel_result": imported.result,
         }
         message = imported.summary()
@@ -531,6 +634,7 @@ class KaggleJobRunner:
             snapshot=imported.snapshot,
             output_dir=output_dir,
             result=imported.result,
+            changed_names=imported.changed_names,
         )
 
     def _fetch_kernel_logs(

@@ -11,13 +11,38 @@ Annotation Helper (Python 3.10, local)
         ▼
 KaggleJobThread ──► KaggleJobRunner
         │
-        ├─ 1. pack images + current labels + model into job.zip
-        ├─ 2. create a private Kaggle dataset (Kaggle auto-extracts the zip)
-        ├─ 3. push a private script kernel on NvidiaTeslaT4 (2x T4)
-        ├─ 4. poll status every 30 s
-        ├─ 5. download labels.json + result.json
-        └─ 6. merge into local labels/ and push an Undo snapshot
+        ├─ 1. reuse model/checkpoint from the private weights dataset
+        │     (models are uploaded only ONCE)
+        ├─ 2. pack only images + current labels into a tiny job.zip
+        ├─ 3. create a private job dataset (Kaggle auto-extracts the zip)
+        ├─ 4. push a private script kernel on NvidiaTeslaT4 (2x T4)
+        ├─ 5. poll status every 30 s
+        ├─ 6. download coordinates.json + result.json (no images back)
+        └─ 7. merge coordinates into local labels/ + Undo snapshot,
+              then jump to the first changed frame so boxes are visible
 ```
+
+### Models once, images later
+
+The first time a model is used, it is uploaded once to a private dataset
+(default `<username>/labelimg-plus-weights`).  Every later job sends only the
+selected images, their current labels and a tiny manifest.  The kernel mounts
+the weights dataset alongside the job dataset, reads the model/checkpoint from
+`/kaggle/input/...`, runs inference, and returns **only YOLO coordinates**.
+
+Example from the live validation: the job bundle for one image dropped from
+~153 MB (model inside the bundle) to **0.14 MB** (model reused), while still
+producing 7 predicted boxes.
+
+Run the one-time sync explicitly if you want all local models uploaded now:
+
+```bash
+python -m kaggle_bridge sync-weights
+```
+
+The first real job also uploads its selected model automatically, so this is
+optional.  Updated model files are detected by size/mtime and a new weights
+dataset version is created.
 
 The local Predict button and local Dynamic SAM 2 are unchanged.  Cloud mode is
 opt-in and can be turned off at any time.
@@ -92,7 +117,18 @@ KAGGLE_API_TOKEN=your-token-here
 If you downloaded `kaggle.json`, put it at `%USERPROFILE%\.kaggle\kaggle.json`
 and leave the token fields blank.
 
-### 2.3 Verify
+### 2.3 Upload models once (optional but recommended)
+
+```bash
+python -m kaggle_bridge sync-weights
+```
+
+This finds `annotation_helper/models/*.pt` (YOLO) and
+`annotation_helper/sam2_models/*.pt` and uploads them to
+`<username>/labelimg-plus-weights`.  It is safe to run again; unchanged files
+are skipped.
+
+### 2.4 Verify
 
 ```bash
 python -m kaggle_bridge.doctor
@@ -106,7 +142,7 @@ GPU quota:    30.00h remaining of 30.00h
 Everything looks ready.
 ```
 
-### 2.4 Use it from the helper
+### 2.5 Use it from the helper
 
 1. Open Annotation Helper on a batch (`images/` + `labels/`).
 2. Tick **Run heavy work on Kaggle (T4 x2)** in the **Compute** card.
@@ -124,21 +160,28 @@ button for interrupted jobs.
 
 ## 3. What gets uploaded
 
-`job.zip` contains:
+`job.zip` normally contains only:
 
 ```
 manifest.json          job id, classes, frame mapping, existing labels
 runner_lib.py          label merge helpers (shared with the kernel)
 images/000000.jpg      sequential JPEG frames
 images/...
-model/sam2.1_hiera_small.pt   optional (SAM 2)
-model/your_yolo.pt            YOLO predict
 ```
 
-Ultralytics/SAM 2 packages and the SAM 2 checkpoint are only uploaded when
-needed.  If a local SAM 2 checkpoint exists, it is included; otherwise the
-kernel downloads the official Meta checkpoint (about 176 MB).  No Kaggle
-credential is ever put in the bundle.
+The YOLO model / SAM 2 checkpoint is **not** in the job bundle when
+`KAGGLE_USE_WEIGHTS_DATASET=true` (the default).  It lives in the private
+weights dataset and is attached as a second kernel input:
+
+```
+<username>/labelimg-plus-job-...   per-job images + labels (deleted after success)
+<username>/labelimg-plus-weights   YOLO models + SAM 2 checkpoints (persistent)
+```
+
+If no SAM 2 checkpoint is available locally, the kernel downloads the official
+Meta checkpoint once per run (~176 MB).  To avoid that, put the checkpoint in
+`annotation_helper/sam2_models/` and run `sync-weights`.  No Kaggle credential
+is ever put in the bundle.
 
 Kaggle auto-extracts the zip inside the private dataset.  The runner supports
 both layouts: an extracted dataset root (`manifest.json` + `images/`) and a
@@ -147,12 +190,16 @@ real `job.zip` for local tests.
 ### Kernel output
 
 ```
-output/labels.json     {original_image_name: [[cls, xc, yc, w, h], ...]}
-output/result.json     status, counts, kernel stats
-output/status.json     last progress marker
+output/coordinates.json  {original_image_name: [[cls, xc, yc, w, h], ...]}
+output/labels.json       same coordinates (compatibility alias)
+output/result.json       status, counts, kernel stats
+output/status.json       last progress marker
 ```
 
-Only changed label files are returned.  The local importer validates:
+No images, masks or model files are written to `/kaggle/working`; the input is
+extracted under `/tmp` and discarded.  Only changed frames are returned.  The
+helper reloads the batch and jumps to the first changed frame, so the returned
+boxes are immediately visible in LabelImg.  The local importer validates:
 - the filename exists in this batch,
 - the path cannot escape `labels/`,
 - the class index is inside `classes.txt`,
@@ -198,6 +245,9 @@ The helper's **Jobs... -> Resume selected** does the same from the UI.
 | `KAGGLE_PYTHON` | auto | Python 3.11+ used to build `.kaggle-venv`. |
 | `KAGGLE_DATASET_PREFIX` | `labelimg-plus-job` | Private job dataset slug. |
 | `KAGGLE_JOB_ROOT` | `kaggle_jobs` | Local job state/log/output folder. |
+| `KAGGLE_USE_WEIGHTS_DATASET` | `true` | Reuse models from the weights dataset instead of uploading them per job. |
+| `KAGGLE_WEIGHTS_DATASET` | `labelimg-plus-weights` | Persistent private weights dataset slug. |
+| `KAGGLE_WEIGHTS_ROOT` | `kaggle_weights` | Local staging folder for weight uploads. |
 | `KAGGLE_POLL_SECONDS` | `30` | Kernel status poll interval. |
 | `KAGGLE_TIMEOUT_HOURS` | `6` | Give up waiting after this long. |
 | `KAGGLE_ACCELERATOR` | `NvidiaTeslaT4` | Kaggle GPU T4 x2. |
@@ -222,9 +272,10 @@ The helper's **Jobs... -> Resume selected** does the same from the UI.
 - SAM 2 uses one T4 for the predictor.  The second T4 is attached and visible
   (`gpu_count=2` in `result.json`) but the current video predictor is
   single-GPU.  It can be used for future batched/parallel jobs.
-- First SAM 2 run is slower because the kernel installs SAM 2 and downloads
-  the checkpoint (about 3-4 minutes on a warm Kaggle image).  YOLO predict is
-  about 20-30 seconds after the kernel starts.
+- SAM 2 runs are slower because the ephemeral kernel installs SAM 2 from
+  GitHub each time (~4-5 minutes).  The checkpoint itself is reused from the
+  weights dataset, so no 176 MB download is needed after `sync-weights`.
+  YOLO predict is about 20-30 seconds after the kernel starts.
 
 ---
 
@@ -234,8 +285,11 @@ Validated on 2026-11-13 with Kaggle user `dukeshavrao`:
 
 | Test | Result |
 |---|---|
+| One-time weights upload | `yolov11l_jul10.pt` (146 MB) + `sam2.1_hiera_small.pt` (176 MB) in `dukeshavrao/labelimg-plus-weights` |
 | YOLO `yolov8n` on 1 bus image | `status=ok`, 5 boxes, 1 label file merged, `gpu_count=2`, 21.1 s kernel |
-| SAM 2.1 Small on 5 synthetic frames | 1 object, 5/5 frames tracked, 5 label files merged, `device=cuda`, `gpu_count=2`, 203.5 s including install/checkpoint |
+| YOLO `yolov11l_jul10.pt` with weights reuse | job bundle **0.14 MB** (was 153 MB), 7 boxes returned, 22.9 s kernel, `gpu_count=2` |
+| SAM 2.1 Small, no checkpoint in bundle | job bundle **0.04 MB**, checkpoint reused from weights dataset, 5/5 frames tracked, 318 s (SAM 2 package install time), `gpu_count=2` |
+| SAM 2.1 Small, first run with download | 1 object, 5/5 frames tracked, 5 label files merged, `device=cuda`, `gpu_count=2`, 203.5 s including install/checkpoint |
 | Authentication | `dukeshavrao`, GPU quota 30h remaining |
 | Unit tests | 24 tests pass on Python 3.10 and 3.13 |
 
@@ -263,9 +317,14 @@ to the kernel folder.
 
 ### `403 Forbidden` while checking a new dataset
 
-`datasets status` returns 403 for a dataset that does not exist yet.  The
-worker treats that as "not found" and proceeds to create it.  This is expected
-and only appears in the log.
+Kaggle returns 403 from `GetDatasetStatus` while a freshly created private
+dataset is still being processed (observed on a ~100 MB upload).  This is no
+longer fatal: the bridge treats 403 as `processing`, keeps polling and
+continues when the dataset becomes `ready`.  A 403 line can still appear in
+the log; that is expected.
+
+If a dataset stays unqueryable for 30 minutes, the job fails with a clear
+message instead of hanging forever.
 
 ### Kernel ERROR
 
@@ -313,6 +372,7 @@ worker requests `NvidiaTeslaT4` both in metadata and on the CLI push.
 python -m kaggle_bridge.doctor
 python -m kaggle_bridge.setup --create-venv
 python -m kaggle_bridge.setup --write-env
+python -m kaggle_bridge sync-weights
 python -m kaggle_bridge jobs
 python -m kaggle_bridge status --job <job-id> --log
 python -m kaggle_bridge resume --job <job-id>
@@ -348,6 +408,9 @@ in section 7.
 - There is no remote-cancel button yet; deleting the kernel on Kaggle stops it.
 - Long videos are not automatically chunked.  Split very long clips or use a
   frame range; SAM 2 memory resets per kernel job.
-- The first SAM 2 run pays the install/checkpoint time.  A future optimization
-  is a shared private weights/source dataset.
+- The first SAM 2 run still pays the SAM 2 package install time.  The checkpoint
+  itself is reused from the weights dataset when `sync-weights` was run.
+- When a new model/checkpoint is added, the weights dataset version re-uploads
+  the staged weight files (Kaggle datasets are snapshots).  Updates are
+  detected by size/mtime.
 - SAM 3 is not part of this bridge; the same job protocol can add it later.

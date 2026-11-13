@@ -7,7 +7,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 ACCELERATOR_T4_X2 = "NvidiaTeslaT4"
 DEFAULT_LICENSE = {"name": "CC0-1.0"}
@@ -85,6 +85,7 @@ def kernel_metadata(
     code_file: str = "runner.py",
     accelerator: str = ACCELERATOR_T4_X2,
     enable_internet: bool = True,
+    extra_dataset_sources: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     owner, slug = kernel_id.split("/", 1)
     validate_slug(owner, "kernel owner")
@@ -93,6 +94,17 @@ def kernel_metadata(
         raise ValueError("kernel title must be at least 5 characters")
     if "/" not in dataset_id:
         raise ValueError(f"invalid dataset id: {dataset_id!r}")
+    sources = [dataset_id]
+    for source in extra_dataset_sources or []:
+        if not source:
+            continue
+        if "/" not in source:
+            raise ValueError(f"invalid extra dataset id: {source!r}")
+        source_owner, source_slug = source.split("/", 1)
+        validate_slug(source_owner, "extra dataset owner")
+        validate_slug(source_slug, "extra dataset slug")
+        if source not in sources:
+            sources.append(source)
     return {
         "id": kernel_id,
         "title": title[:50],
@@ -104,7 +116,7 @@ def kernel_metadata(
         "enable_tpu": False,
         "enable_internet": bool(enable_internet),
         "machine_shape": accelerator,
-        "dataset_sources": [dataset_id],
+        "dataset_sources": sources,
         "competition_sources": [],
         "kernel_sources": [],
         "model_sources": [],

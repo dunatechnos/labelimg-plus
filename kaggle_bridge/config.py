@@ -28,6 +28,8 @@ DEFAULT_ACCELERATOR = "NvidiaTeslaT4"
 DEFAULT_POLL_SECONDS = 30
 DEFAULT_TIMEOUT_HOURS = 6.0
 DEFAULT_MAX_BUNDLE_MB = 4096.0
+DEFAULT_WEIGHTS_DATASET = "labelimg-plus-weights"
+DEFAULT_WEIGHTS_ROOT = "kaggle_weights"
 KAGGLE_VENV_DIR = ".kaggle-venv"
 KAGGLE_JOB_DIR = "kaggle_jobs"
 
@@ -199,6 +201,9 @@ class Config:
     python_path: str = ""
     dataset_prefix: str = DEFAULT_DATASET_PREFIX
     job_root: Path = field(default_factory=lambda: repo_root() / KAGGLE_JOB_DIR)
+    use_weights_dataset: bool = True
+    weights_dataset: str = DEFAULT_WEIGHTS_DATASET
+    weights_root: Path = field(default_factory=lambda: repo_root() / DEFAULT_WEIGHTS_ROOT)
     poll_seconds: int = DEFAULT_POLL_SECONDS
     timeout_hours: float = DEFAULT_TIMEOUT_HOURS
     delete_dataset_after: bool = True
@@ -265,6 +270,8 @@ class Config:
             f"username: {self.username or '(resolved after auth)'}",
             f"dataset prefix: {self.dataset_prefix}",
             f"job root: {self.job_root}",
+            f"weights dataset: {self.weights_dataset}",
+            f"use weights dataset: {self.use_weights_dataset}",
             f"accelerator: {self.accelerator}",
         ]
         return lines
@@ -395,6 +402,10 @@ class Config:
         self.job_root.mkdir(parents=True, exist_ok=True)
         return self.job_root
 
+    def ensure_weights_root(self) -> Path:
+        self.weights_root.mkdir(parents=True, exist_ok=True)
+        return self.weights_root
+
 
 def _config_from_env(root: Path, env_path: Path) -> Config:
     values = parse_env_file(env_path)
@@ -414,6 +425,21 @@ def _config_from_env(root: Path, env_path: Path) -> Config:
     if not job_root.is_absolute():
         job_root = root / job_root
     cfg.job_root = job_root
+    cfg.use_weights_dataset = _truthy(
+        cfg.get("KAGGLE_USE_WEIGHTS_DATASET"), True
+    )
+    cfg.weights_dataset = (
+        cfg.get("KAGGLE_WEIGHTS_DATASET", DEFAULT_WEIGHTS_DATASET).strip()
+        or DEFAULT_WEIGHTS_DATASET
+    )
+    weights_root_value = (
+        cfg.get("KAGGLE_WEIGHTS_ROOT", DEFAULT_WEIGHTS_ROOT).strip()
+        or DEFAULT_WEIGHTS_ROOT
+    )
+    weights_root = Path(os.path.expandvars(os.path.expanduser(weights_root_value)))
+    if not weights_root.is_absolute():
+        weights_root = root / weights_root
+    cfg.weights_root = weights_root
     cfg.poll_seconds = max(5, _as_int(cfg.get("KAGGLE_POLL_SECONDS"), DEFAULT_POLL_SECONDS))
     cfg.timeout_hours = max(
         0.25, _as_float(cfg.get("KAGGLE_TIMEOUT_HOURS"), DEFAULT_TIMEOUT_HOURS)

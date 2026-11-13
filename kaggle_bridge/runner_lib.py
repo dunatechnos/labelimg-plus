@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -237,6 +237,7 @@ class ApplyResult:
     snapshot: Dict[str, List[str]]
     changed: int
     boxes: int
+    changed_names: List[str] = field(default_factory=list)
 
 
 def apply_label_updates(
@@ -256,6 +257,7 @@ def apply_label_updates(
     snapshot: Dict[str, List[str]] = {}
     changed = 0
     boxes = 0
+    changed_names: List[str] = []
 
     if not isinstance(updates, dict):
         raise ValueError("labels.json must contain an object mapping image names to labels")
@@ -289,5 +291,11 @@ def apply_label_updates(
         write_label_lines_atomic(label_path, parsed)
         changed += 1
         boxes += len(parsed)
+        changed_names.append(name)
 
-    return ApplyResult(snapshot=snapshot, changed=changed, boxes=boxes)
+    return ApplyResult(
+        snapshot=snapshot,
+        changed=changed,
+        boxes=boxes,
+        changed_names=changed_names,
+    )

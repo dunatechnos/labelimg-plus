@@ -85,7 +85,7 @@ class BundleImportTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (output / "labels.json").write_text(
+            (output / "coordinates.json").write_text(
                 json.dumps(
                     {
                         "frame_001.jpg": [
@@ -99,7 +99,48 @@ class BundleImportTests(unittest.TestCase):
                 job_dir, names, ["dog"], labels_dir=labels
             )
             self.assertEqual(result.changed, 1)
+            self.assertEqual(result.changed_names, ["frame_001.jpg"])
+            self.assertEqual(result.labels_path.name, "coordinates.json")
             self.assertIn(str((labels / "frame_001.txt").resolve()), result.snapshot)
+
+    def test_weights_override_keeps_model_out_of_bundle(self):
+        try:
+            import cv2  # noqa: F401
+        except Exception:
+            self.skipTest("opencv not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            images, labels, model, names = _make_dataset(root)
+            spec = JobSpec(
+                job_type="yolo_predict",
+                images_dir=str(images),
+                labels_dir=str(labels),
+                models_dir=str(images.parent / "models"),
+                images=names,
+                classes=["dog"],
+                start_index=1,
+                end_index=1,
+                model_path=str(model),
+            )
+            spec.validate()
+            info = build_bundle(
+                spec,
+                root / "job_weights",
+                include_sam2_checkpoint=False,
+                keep_bundle=True,
+                model_override={
+                    "kind": "yolo",
+                    "source": "weights",
+                    "weights_file": "dummy.pt",
+                    "weights_dataset": "alice/labelimg-plus-weights",
+                },
+            )
+            self.assertFalse(info.model_included)
+            with zipfile.ZipFile(info.job_zip) as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+                self.assertFalse(any(name.startswith("model/") for name in archive.namelist()))
+            self.assertEqual(manifest["model"]["source"], "weights")
+            self.assertEqual(manifest["model"]["weights_file"], "dummy.pt")
 
     def test_sam2_bundle_without_checkpoint(self):
         try:

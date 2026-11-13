@@ -21,6 +21,7 @@ class ImportResult:
     snapshot: Dict[str, List[str]]
     result: Dict[str, Any] = field(default_factory=dict)
     labels_path: Optional[Path] = None
+    changed_names: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         message = self.result.get("message") or ""
@@ -78,11 +79,14 @@ def import_job_output(
         )
 
     labels_path = _find_file(output_dir, "labels.json")
+    coordinates_path = _find_file(output_dir, "coordinates.json")
+    if coordinates_path is not None:
+        labels_path = coordinates_path
     if labels_path is None:
         if result and result.get("changed", 0) == 0:
             return ImportResult(0, 0, {}, result, None)
         raise ImportError_(
-            "labels.json was not found in the Kaggle output. "
+            "coordinates.json/labels.json was not found in the Kaggle output. "
             "Check the kernel log for an early failure."
         )
 
@@ -107,6 +111,7 @@ def import_job_output(
         snapshot=applied.snapshot,
         result=result,
         labels_path=labels_path,
+        changed_names=applied.changed_names,
     )
 
 

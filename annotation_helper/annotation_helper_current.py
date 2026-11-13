@@ -2603,6 +2603,7 @@ class AnnotationApp(QWidget):
         thread.progress.connect(self.on_kaggle_progress)
         thread.status.connect(self.on_kaggle_status)
         thread.snapshot.connect(self.on_kaggle_snapshot)
+        thread.changed_files.connect(self.on_kaggle_changed_files)
         thread.job_created.connect(
             lambda job_id: self.kaggle_status.setText(f"Kaggle job: {job_id}")
         )
@@ -2646,6 +2647,30 @@ class AnnotationApp(QWidget):
                 self.push_undo_snapshot(files_snapshot)
         except Exception as exc:
             print("on_kaggle_snapshot error:", exc)
+
+    def on_kaggle_changed_files(self, names):
+        """Jump to the first changed frame so the returned boxes are visible."""
+        try:
+            changed = set(str(name) for name in (names or []))
+            if not changed:
+                return
+            current = None
+            if 1 <= int(self.current_index or 0) <= len(self.images):
+                current = self.images[int(self.current_index) - 1]
+            if current in changed:
+                return
+            for index, name in enumerate(self.images, start=1):
+                if name in changed:
+                    self.current_index = index
+                    if hasattr(self, "spin_index"):
+                        self.spin_index.setValue(index)
+                    self.load_image(index)
+                    self.label_status.setText(
+                        f"Kaggle coordinates loaded: showing {name}"
+                    )
+                    break
+        except Exception as exc:
+            print("on_kaggle_changed_files error:", exc)
 
     def on_kaggle_done(self, message):
         self.progress_bar.setValue(100)

@@ -280,6 +280,45 @@ def imread(path: Path):
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
+def resolve_model_file(job_dir: Path, model_info: Dict[str, Any]) -> Path:
+    """Resolve a bundle model or a file from the persistent weights dataset."""
+    if model_info.get("source") == "weights":
+        name = str(model_info.get("weights_file") or "").strip()
+        if not name:
+            raise RuntimeError("weights model entry has no weights_file")
+        if "/" in name or "\\" in name or name in (".", ".."):
+            raise RuntimeError(f"unsafe weights filename: {name!r}")
+        explicit_dir = os.environ.get("LABELIMG_WEIGHTS_DIR")
+        candidates = []
+        if explicit_dir:
+            candidates.extend(glob.glob(str(Path(explicit_dir) / name)))
+        candidates.extend(
+            glob.glob(str(Path("/kaggle/input") / "**" / name), recursive=True)
+        )
+        candidates = [path for path in candidates if Path(path).is_file()]
+        if not candidates:
+            attached = sorted(
+                str(path) for path in Path("/kaggle/input").glob("*") if path.is_dir()
+            )
+            raise FileNotFoundError(
+                f"Weights file {name!r} not found in the attached weights dataset. "
+                f"Attached inputs: {attached}"
+            )
+        log(f"Using weights file: {candidates[0]}")
+        return Path(candidates[0])
+    relative = model_info.get("file")
+    if not relative:
+        raise RuntimeError("manifest model entry has neither file nor weights_file")
+    path = (job_dir / relative).resolve()
+    try:
+        path.relative_to(job_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError(f"Model path escapes job dir: {relative!r}") from exc
+    if not path.is_file():
+        raise FileNotFoundError(f"Model file missing from bundle: {path}")
+    return path
+
+
 # ----------------------------------------------------------------------
 # YOLO predict
 # ----------------------------------------------------------------------
@@ -289,9 +328,9 @@ def run_yolo(manifest: Dict[str, Any], job_dir: Path) -> Dict[str, Any]:
     import torch
 
     model_info = manifest.get("model") or {}
-    model_path = job_dir / model_info.get("file", "")
+    model_path = resolve_model_file(job_dir, model_info)
     if not model_path.is_file():
-        raise RuntimeError(f"YOLO model missing from bundle: {model_path}")
+        raise RuntimeError(f"YOLO model missing: {model_path}")
     device = 0 if torch.cuda.is_available() else "cpu"
     log(f"Loading YOLO model {model_path.name} (device={device})...")
     model = YOLO(str(model_path))
@@ -427,10 +466,10 @@ def run_sam2(manifest: Dict[str, Any], job_dir: Path) -> Dict[str, Any]:
 
     model_info = manifest.get("model") or {}
     checkpoint: Optional[Path] = None
-    if model_info.get("file"):
-        checkpoint = job_dir / model_info["file"]
+    if model_info.get("source") == "weights" or model_info.get("file"):
+        checkpoint = resolve_model_file(job_dir, model_info)
         if not checkpoint.is_file():
-            raise RuntimeError(f"SAM 2 checkpoint missing from bundle: {checkpoint}")
+            raise RuntimeError(f"SAM 2 checkpoint missing: {checkpoint}")
     else:
         url = model_info.get("checkpoint_url")
         if not url:
@@ -671,14 +710,19 @@ def main() -> int:
     else:
         raise RuntimeError(f"Unknown job type: {job_type!r}")
 
-    write_json(LABELS_FILE, outcome["labels"])
+    coordinates = outcome["labels"]
+    write_json(LABELS_FILE, coordinates)
+    # Explicit coordinates-only output.  No frames/masks/checkpoints are
+    # written to /kaggle/working, so Kaggle returns just this small file.
+    write_json(OUTPUT_DIR / "coordinates.json", coordinates)
     result = {
         "schema": 1,
         "job_id": job_id,
         "type": job_type,
         "status": "ok",
-        "changed": len(outcome["labels"]),
+        "changed": len(coordinates),
         "message": outcome["message"],
+        "coordinates_file": "coordinates.json",
         "stats": outcome.get("stats") or {},
         "elapsed_seconds": round(time.time() - START_TS, 1),
     }

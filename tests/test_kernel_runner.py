@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 
 from kaggle_bridge.kaggle_cli import _norm_state
-from kaggle_bridge.kernel_runner import load_manifest, safe_extract
+from kaggle_bridge.kernel_runner import load_manifest, resolve_model_file, safe_extract
 
 
 class KernelRunnerTests(unittest.TestCase):
@@ -54,6 +55,34 @@ class KernelRunnerTests(unittest.TestCase):
             }
             (job / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             self.assertEqual(load_manifest(job)["images"][0]["name"], "frame.jpg")
+
+    def test_resolve_bundle_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp)
+            (job / "model").mkdir()
+            (job / "model" / "x.pt").write_bytes(b"x")
+            path = resolve_model_file(job, {"file": "model/x.pt"})
+            self.assertEqual(path, (job / "model" / "x.pt").resolve())
+
+    def test_resolve_weights_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            weights = root / "weights"
+            weights.mkdir()
+            (weights / "x.pt").write_bytes(b"x")
+            old = os.environ.get("LABELIMG_WEIGHTS_DIR")
+            os.environ["LABELIMG_WEIGHTS_DIR"] = str(weights)
+            try:
+                path = resolve_model_file(
+                    root / "job",
+                    {"source": "weights", "weights_file": "x.pt"},
+                )
+            finally:
+                if old is None:
+                    os.environ.pop("LABELIMG_WEIGHTS_DIR", None)
+                else:
+                    os.environ["LABELIMG_WEIGHTS_DIR"] = old
+            self.assertEqual(path, (weights / "x.pt").resolve())
 
     def test_load_manifest_rejects_escape(self):
         with tempfile.TemporaryDirectory() as tmp:

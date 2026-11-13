@@ -135,6 +135,8 @@ class JobStore:
             "kernel_ref": None,
             "dataset_url": None,
             "kernel_url": None,
+            "dataset_created": False,
+            "weights_dataset": None,
             "bundle_zip": None,
             "bundle_bytes": 0,
             "output_dir": None,

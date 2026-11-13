@@ -58,6 +58,17 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(meta["kernel_type"], "script")
         self.assertEqual(meta["dataset_sources"], [meta["id"]])
 
+        with_weights = kernel_metadata(
+            "alice/labelimg-plus-run-job",
+            "LabelImg Plus Run job",
+            "alice/labelimg-plus-job",
+            extra_dataset_sources=["alice/labelimg-plus-weights"],
+        )
+        self.assertEqual(
+            with_weights["dataset_sources"],
+            ["alice/labelimg-plus-job", "alice/labelimg-plus-weights"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

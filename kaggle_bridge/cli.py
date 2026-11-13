@@ -28,6 +28,7 @@ from .doctor import run_doctor
 from .importer import import_job_output
 from .jobstore import JobStore
 from .spec import JobSpec, SpecError
+from .weights import sync_weights
 from .worker import KaggleJobError, KaggleJobRunner
 
 
@@ -228,6 +229,20 @@ def cmd_doctor(args) -> int:
     return run_doctor(load_config(), check_auth=not args.no_auth)
 
 
+def cmd_sync_weights(args) -> int:
+    cfg = load_config()
+    try:
+        mapping = sync_weights(cfg, args.username, log=print)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print("")
+    print("Weights dataset is ready (uploaded once, now reused):")
+    for local, remote in mapping.items():
+        print(f"  {remote}  <-  {local}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m kaggle_bridge",
@@ -239,6 +254,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="Check credentials, CLI and environment")
     p.add_argument("--no-auth", action="store_true", help="Skip network auth check")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser(
+        "sync-weights",
+        help="Upload all local YOLO/SAM2 weights once and reuse them",
+    )
+    p.add_argument("--username", default="", help="Kaggle username (auto-detected)")
+    p.set_defaults(func=cmd_sync_weights)
 
     p = sub.add_parser("jobs", help="List local jobs")
     p.add_argument("--limit", type=int, default=100)

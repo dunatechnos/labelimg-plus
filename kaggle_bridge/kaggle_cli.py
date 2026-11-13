@@ -239,13 +239,8 @@ class KaggleCLI:
     # Datasets
     # ------------------------------------------------------------------
     def dataset_exists(self, ref: str) -> bool:
-        result = self._run(
-            ["datasets", "status", ref], timeout=120, check=False
-        )
-        text = result.output.lower()
-        if result.returncode == 0 and "not found" not in text:
-            return True
-        return False
+        status = self.dataset_status(ref)
+        return status in ("ready", "processing", "ok", "complete", "pending")
 
     def dataset_create(self, folder: Path) -> CliResult:
         result = self._run(
@@ -280,7 +275,25 @@ class KaggleCLI:
         return result
 
     def dataset_status(self, ref: str) -> str:
-        result = self._run(["datasets", "status", ref], timeout=120)
+        result = self._run(["datasets", "status", ref], timeout=120, check=False)
+        if result.returncode != 0:
+            text = result.output.lower()
+            # Kaggle returns 403 for a brand-new private dataset while it is
+            # still being created/processed.  Treat it as a transient state
+            # instead of failing the whole job (seen on a ~100 MB upload).
+            if "403" in text or "forbidden" in text:
+                self._log(
+                    f"Dataset {ref} is not queryable yet (403); treating as processing."
+                )
+                return "processing"
+            if "404" in text or "not found" in text:
+                return "not_found"
+            raise KaggleCliError(
+                f"Could not read dataset status for {ref}:\n{_tail(result.output, 2000)}",
+                result.returncode,
+                result.stdout,
+                result.stderr,
+            )
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not lines:
             return "unknown"
@@ -290,6 +303,45 @@ class KaggleCLI:
             if candidate in value:
                 return candidate
         return value
+
+    def dataset_files(self, ref: str) -> List[Dict[str, str]]:
+        """Return dataset files as ``[{"name": ..., "size": ...}, ...]``."""
+        result = self._run(
+            ["datasets", "files", ref, "--csv"],
+            timeout=120,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        text = (result.stdout or "").strip()
+        if not text:
+            return []
+        rows: List[Dict[str, str]] = []
+        try:
+            import csv
+            import io
+
+            reader = csv.DictReader(io.StringIO(text))
+            for row in reader:
+                name = (row.get("name") or row.get("fileName") or "").strip()
+                if name:
+                    rows.append(
+                        {
+                            "name": name,
+                            "size": str(row.get("size") or row.get("totalBytes") or ""),
+                        }
+                    )
+        except Exception:
+            for line in text.splitlines()[1:]:
+                parts = [part.strip() for part in line.split(",")]
+                if parts and parts[0]:
+                    rows.append(
+                        {
+                            "name": parts[0],
+                            "size": parts[1] if len(parts) > 1 else "",
+                        }
+                    )
+        return rows
 
     def wait_dataset_ready(
         self,
@@ -310,6 +362,10 @@ class KaggleCLI:
                 return status
             if status in ("error", "failed"):
                 raise KaggleCliError(f"Kaggle dataset {ref} failed with status {status!r}")
+            if status in ("not_found",):
+                raise KaggleCliError(
+                    f"Kaggle dataset {ref} was not found after creation."
+                )
             time.sleep(max(2, poll))
         raise KaggleCliError(
             f"Kaggle dataset {ref} was not ready after {timeout:.0f}s "

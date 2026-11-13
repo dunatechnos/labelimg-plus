@@ -73,6 +73,7 @@ class RunnerLibTests(unittest.TestCase):
                 num_classes=2,
             )
             self.assertEqual(result.changed, 1)
+            self.assertEqual(result.changed_names, ["a.jpg"])
             self.assertIn(str((labels / "a.txt").resolve()), result.snapshot)
             self.assertEqual(
                 (labels / "a.txt").read_text(encoding="utf-8").strip(),

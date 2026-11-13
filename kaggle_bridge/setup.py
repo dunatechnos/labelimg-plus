@@ -67,6 +67,9 @@ ENV_TEMPLATE = """# Kaggle cloud offload for labelImg Plus.
 # ---------------------------------------------------------------------------
 KAGGLE_DATASET_PREFIX={dataset_prefix}
 KAGGLE_JOB_ROOT=kaggle_jobs
+KAGGLE_USE_WEIGHTS_DATASET=true
+KAGGLE_WEIGHTS_DATASET=labelimg-plus-weights
+KAGGLE_WEIGHTS_ROOT=kaggle_weights
 KAGGLE_POLL_SECONDS={poll_seconds}
 KAGGLE_TIMEOUT_HOURS={timeout_hours}
 KAGGLE_ACCELERATOR={accelerator}
@@ -82,6 +85,9 @@ def default_env_values() -> Dict[str, str]:
     return {
         "KAGGLE_DATASET_PREFIX": DEFAULT_DATASET_PREFIX,
         "KAGGLE_JOB_ROOT": "kaggle_jobs",
+        "KAGGLE_USE_WEIGHTS_DATASET": "true",
+        "KAGGLE_WEIGHTS_DATASET": "labelimg-plus-weights",
+        "KAGGLE_WEIGHTS_ROOT": "kaggle_weights",
         "KAGGLE_POLL_SECONDS": str(DEFAULT_POLL_SECONDS),
         "KAGGLE_TIMEOUT_HOURS": str(DEFAULT_TIMEOUT_HOURS),
         "KAGGLE_ACCELERATOR": DEFAULT_ACCELERATOR,
@@ -251,6 +257,11 @@ def main(argv=None) -> int:
         help="Create .env from the template if missing",
     )
     parser.add_argument(
+        "--upload-weights",
+        action="store_true",
+        help="Upload all local YOLO models + SAM 2 checkpoints once",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Run doctor after setup",
@@ -290,7 +301,18 @@ def main(argv=None) -> int:
             create_venv(cfg, force=args.force)
             cfg = load_config()
 
-        if args.check or not (args.create_venv or args.write_env or updates):
+        if args.upload_weights:
+            from .weights import sync_weights
+
+            sync_weights(cfg, log=print)
+            cfg = load_config()
+
+        if args.check or not (
+            args.create_venv
+            or args.write_env
+            or updates
+            or args.upload_weights
+        ):
             from .doctor import run_doctor
 
             return run_doctor(cfg, check_auth=not args.no_auth)

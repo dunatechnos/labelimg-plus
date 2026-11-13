@@ -34,6 +34,8 @@ def doctor_lines(
     lines.append(f"Config dir:   {cfg.kaggle_home}")
     lines.append(f"Job root:     {cfg.job_root}")
     lines.append(f"Dataset prefix: {cfg.dataset_prefix}")
+    lines.append(f"Weights ds:   {cfg.weights_dataset}")
+    lines.append(f"Reuse weights: {cfg.use_weights_dataset}")
     lines.append(f"Accelerator:  {cfg.accelerator}")
     lines.append("")
 
@@ -71,6 +73,17 @@ def doctor_lines(
                 try:
                     username = cli.check_auth()
                     lines.append(f"Authenticated: yes ({username})")
+                    try:
+                        from .weights import WeightsManager
+
+                        weights_ref = WeightsManager(cfg, cli).dataset_id(username)
+                        weights_files = cli.dataset_files(weights_ref)
+                        lines.append(
+                            f"Weights data: {weights_ref} "
+                            f"({len(weights_files)} file(s))"
+                        )
+                    except Exception as exc:
+                        lines.append(f"Weights data: could not check ({exc})")
                     try:
                         for item in cli.quota():
                             if str(item.get("resource", "")).upper() != "GPU":
