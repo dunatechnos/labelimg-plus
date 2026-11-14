@@ -61,9 +61,18 @@ Enabled by default (`KAGGLE_USE_SESSION_DATASET=true`):
 2. Every Predict/SAM 2 click writes only a tiny command (selected boxes,
    range, classes, current labels) into a new version of the fixed kernel.
    No images and no separate command dataset are uploaded.
-3. The fixed kernel `labelimg-plus-runner` is reused; each click creates a
+3. **Cancel** button in the Compute card stops a queued/running kernel
+   immediately (deletes that kernel; the next click recreates it).
+4. **GPU-only fallback:** T4 x2 → L4 x1 → H100 → A100.  Kaggle has no
+   separate single-T4 option: `NvidiaTeslaT4` is always T4 x2.  Each
+   accelerator gets **`KAGGLE_QUEUE_TIMEOUT_MINUTES` = 5** fixed; if it is
+   still queued, the bridge cancels it and tries the next.  If none starts,
+   the job **stops** with a clear LabelImg error.  CPU is never used.
+   The **Check GPUs** button probes the accelerators with tiny kernels and
+   shows the actual GPU names (or CPU/queued) before you run a real job.
+5. The fixed kernel `labelimg-plus-runner` is reused; each click creates a
    new version (visible in Kaggle, no kernel spam).
-4. On app close, the session dataset is deleted from Kaggle.  The weights
+6. On app close, the session dataset is deleted from Kaggle.  The weights
    dataset and the fixed kernel remain.  If a job is still running, the app
    waits up to 10 minutes before closing/cleaning.
 
@@ -285,6 +294,10 @@ The helper's **Jobs... -> Resume selected** does the same from the UI.
 | `KAGGLE_KERNEL_SLUG` | `labelimg-plus-runner` | Fixed kernel slug. |
 | `KAGGLE_MAX_SESSION_GB` | `20` | Refuse a session images upload larger than this. |
 | `KAGGLE_SESSION_KEEP_LOCAL` | `false` | Keep the local session zip after upload. |
+| `KAGGLE_ACCELERATORS` | `NvidiaTeslaT4,NvidiaL4X1,NvidiaH100,NvidiaTeslaA100` | GPU fallback order. |
+| `KAGGLE_QUEUE_TIMEOUT_MINUTES` | `5` | Fixed per-accelerator queue wait before switching. |
+| `KAGGLE_REQUIRE_GPU` | `true` | If true, never import CPU results and never add CPU. |
+| `KAGGLE_CPU_FALLBACK` | `false` | Only used when `KAGGLE_REQUIRE_GPU=false`. |
 | `KAGGLE_POLL_SECONDS` | `30` | Kernel status poll interval. |
 | `KAGGLE_TIMEOUT_HOURS` | `6` | Give up waiting after this long. |
 | `KAGGLE_ACCELERATOR` | `NvidiaTeslaT4` | Kaggle GPU T4 x2. |
@@ -316,6 +329,9 @@ The helper's **Jobs... -> Resume selected** does the same from the UI.
 - SAM 2 click: about 2 minutes, mostly model loading + tracking.  The SAM 2
   package comes from the local wheel (~15 s instead of a 4-5 minute git build)
   and the checkpoint is reused from the weights dataset.
+- If T4 x2 stays queued for 5 minutes, the bridge automatically tries
+  L4 x1/H100/A100 (if your account is eligible).  If none is allocated, the
+  job stops; CPU is not used (`KAGGLE_REQUIRE_GPU=true`).
 - The fixed kernel keeps one version per click.  Set
   `KAGGLE_DELETE_KERNEL_AFTER=true` or delete it manually if you do not want
   version history.
@@ -355,6 +371,34 @@ bridge uses `labelimg-plus-job-...` for datasets and
 Kaggle auto-extracts uploaded zip files.  The runner supports both an
 extracted dataset root and a real zip.  If you see this on an old build,
 update `kaggle_bridge/kernel_runner.py`.
+
+### Job is QUEUED for a long time
+
+The Compute card now has **Cancel Kaggle job** (and in the jobs dialog the
+same remote kernel can be stopped).  The bridge gives each accelerator
+`KAGGLE_QUEUE_TIMEOUT_MINUTES` (fixed 5 by default) and then automatically
+moves to the next one.  If none starts, the job stops and LabelImg shows
+`No usable GPU was allocated`; CPU is not used.
+
+Kaggle does not expose a separate single-T4 accelerator: `NvidiaTeslaT4` is
+always T4 x2.  The kernel can use one T4, but the queue/allocation is for the
+x2 option.
+
+### Check GPUs first
+
+**Kaggle setup → Check GPUs** runs tiny private probe kernels for each
+configured accelerator and prints the actual result, e.g.:
+
+```
+NvidiaTeslaT4: 2 GPU: Tesla T4, Tesla T4
+NvidiaL4X1:    2 GPU: Tesla T4, Tesla T4
+NvidiaH100:    2 GPU: Tesla T4, Tesla T4
+NvidiaTeslaA100: QUEUED after 45s (no allocation)
+```
+
+On this account the L4/H100 requests currently resolve to 2x T4; A100 may
+queue.  There is no usable single-T4 option.  TPU is not used because this
+pipeline needs PyTorch/SAM 2 (`torch_xla` is absent and TF sees CPU only).
 
 ### Session images upload is slow / too large
 
@@ -451,6 +495,7 @@ python -m kaggle_bridge.setup --write-env
 python -m kaggle_bridge.setup --build-sam2-wheel
 python -m kaggle_bridge sync-weights
 python -m kaggle_bridge jobs
+python -m kaggle_bridge cancel --job <job-id>
 python -m kaggle_bridge session-cleanup
 python -m kaggle_bridge status --job <job-id> --log
 python -m kaggle_bridge resume --job <job-id>

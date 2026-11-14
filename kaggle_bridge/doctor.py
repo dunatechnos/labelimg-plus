@@ -41,7 +41,8 @@ def doctor_lines(
         f"Kernel:       "
         f"{cfg.kernel_slug if cfg.fixed_kernel else '(new per click)'}"
     )
-    lines.append(f"Accelerator:  {cfg.accelerator}")
+    lines.append(f"Accelerators: {', '.join(cfg.accelerators)}")
+    lines.append(f"Queue timeout: {cfg.queue_timeout_minutes:.0f} min")
     lines.append("")
 
     if not cfg.env_path.exists():

@@ -6,7 +6,12 @@ UI-free and testable.
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
 import sys
+import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -46,11 +51,12 @@ from kaggle_bridge.config import (
 from kaggle_bridge.doctor import doctor_lines
 from kaggle_bridge.jobstore import JobBusyError, JobNotFoundError, JobStore
 from kaggle_bridge.kaggle_cli import KaggleCLI, KaggleCliError
+from kaggle_bridge.metadata import slugify
 from kaggle_bridge.session import RemoteSession
 from kaggle_bridge.setup import create_venv
 from kaggle_bridge.spec import JobSpec, SpecError
 from kaggle_bridge.weights import sync_weights
-from kaggle_bridge.worker import KaggleJobError, KaggleJobRunner
+from kaggle_bridge.worker import JobCancelled, KaggleJobError, KaggleJobRunner
 
 
 # ----------------------------------------------------------------------
@@ -63,6 +69,7 @@ class KaggleJobThread(QThread):
     changed_files = pyqtSignal(list)
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
+    cancelled = pyqtSignal(str)
     job_created = pyqtSignal(str)
 
     def __init__(self, spec: Optional[JobSpec] = None, job_id: Optional[str] = None,
@@ -74,6 +81,13 @@ class KaggleJobThread(QThread):
         self.job_id = job_id
         self.resume = resume
         self._log_lines: List[str] = []
+        self._cancel_event = threading.Event()
+        self._runner: Optional[KaggleJobRunner] = None
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        if self._runner is not None:
+            self._runner.cancel()
 
     def _log(self, message: str) -> None:
         self._log_lines.append(str(message))
@@ -94,7 +108,9 @@ class KaggleJobThread(QThread):
                 status=lambda message: self.status.emit(str(message)),
                 log=self._log,
                 snapshot=lambda data: self.snapshot.emit(dict(data)),
+                cancel_event=self._cancel_event,
             )
+            self._runner = runner
             if self.job_id:
                 result = runner.run(job_id=self.job_id, resume=True)
             else:
@@ -102,6 +118,8 @@ class KaggleJobThread(QThread):
             self.job_created.emit(result.job_id)
             self.changed_files.emit(list(result.changed_names or []))
             self.done.emit(result.message)
+        except JobCancelled as exc:
+            self.cancelled.emit(str(exc))
         except (KaggleJobError, JobBusyError, ConfigError, SpecError, JobNotFoundError) as exc:
             details = str(exc)
             job_id = getattr(exc, "job_id", "") or self.job_id or ""
@@ -181,6 +199,113 @@ class KaggleSessionThread(QThread):
             self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
 
 
+class KaggleGPUCheckThread(QThread):
+    log = pyqtSignal(str)
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    PROBE = (
+        "import torch\n"
+        "count = torch.cuda.device_count() if torch.cuda.is_available() else 0\n"
+        "print('PROBE_GPU_COUNT', count)\n"
+        "for i in range(count):\n"
+        "    print('PROBE_GPU_NAME', i, torch.cuda.get_device_name(i))\n"
+        "print('PROBE_DONE')\n"
+    )
+
+    def __init__(self, accelerators: List[str], wait_seconds: int = 45, parent=None):
+        super().__init__(parent)
+        self.accelerators = [a for a in accelerators if a and a.lower() != "cpu"]
+        self.wait_seconds = max(15, int(wait_seconds))
+
+    def _probe(self, cli: KaggleCLI, root: Path, accelerator: str) -> str:
+        slug = slugify(accelerator)
+        kernel_slug = f"labelimg-plus-gpu-check-{slug}"[:50].rstrip("-")
+        kernel_id = f"{cli.cfg.username}/{kernel_slug}"
+        title = f"LabelImg Plus GPU Check {accelerator}"[:50]
+        folder = root / kernel_slug
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "probe.py").write_text(self.PROBE, encoding="utf-8")
+        metadata = {
+            "id": kernel_id,
+            "title": title,
+            "code_file": "probe.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": True,
+            "enable_gpu": True,
+            "enable_tpu": False,
+            "enable_internet": False,
+            "machine_shape": accelerator,
+            "dataset_sources": [],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": [],
+        }
+        (folder / "kernel-metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
+        try:
+            push = cli.kernels_push(folder, accelerator=accelerator)
+            match = re.search(r"Kernel version\s+(\d+)", push.output or "")
+            version = int(match.group(1)) if match else None
+            run_ref = f"{kernel_id}/{version}" if version else kernel_id
+            status = None
+            deadline = time.time() + self.wait_seconds
+            while time.time() < deadline:
+                status = cli.kernels_status(run_ref)
+                if status.terminal:
+                    break
+                time.sleep(5)
+            if status is not None and status.state == "COMPLETE":
+                log_path = root / f"{slug}.log"
+                text = cli.kernels_logs(run_ref, log_path)
+                count = None
+                names = []
+                for line in text.splitlines():
+                    if "PROBE_GPU_COUNT" in line:
+                        match = re.search(r"PROBE_GPU_COUNT\s+(\d+)", line)
+                        if match:
+                            count = int(match.group(1))
+                    if "PROBE_GPU_NAME" in line:
+                        match = re.search(r"PROBE_GPU_NAME\s+\d+\s+(.+?)(?:\\n|\"|$)", line)
+                        if match:
+                            names.append(match.group(1).strip())
+                if count is None:
+                    return "COMPLETE (no GPU probe output)"
+                if count <= 0:
+                    return "CPU only (not usable)"
+                return f"{count} GPU: {', '.join(names) or 'unknown'}"
+            if status is not None and status.state == "QUEUED":
+                return f"QUEUED after {self.wait_seconds}s (no allocation)"
+            return status.state if status else "unknown"
+        finally:
+            try:
+                cli.cancel_kernel(kernel_id)
+            except Exception:
+                pass
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def run(self):
+        try:
+            cfg = load_config()
+            cli = KaggleCLI(cfg, log=None)
+            cli.check_auth()
+            root = Path(cfg.job_root) / "gpu_check"
+            shutil.rmtree(root, ignore_errors=True)
+            root.mkdir(parents=True, exist_ok=True)
+            lines = []
+            for accelerator in self.accelerators:
+                self.log.emit(f"Checking {accelerator} (max {self.wait_seconds}s)...")
+                result = self._probe(cli, root, accelerator)
+                self.log.emit(f"{accelerator}: {result}")
+                lines.append(f"{accelerator}: {result}")
+            self.done.emit("\n".join(lines))
+        except Exception as exc:
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+
 class KaggleWeightsThread(QThread):
     log = pyqtSignal(str)
     done = pyqtSignal(str)
@@ -202,12 +327,13 @@ class KaggleWeightsThread(QThread):
 class KaggleSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Kaggle T4 x2 setup")
-        self.resize(640, 620)
+        self.setWindowTitle("Kaggle GPU setup")
+        self.resize(700, 760)
         self.cfg: Config = load_config()
         self.setup_thread: Optional[KaggleSetupThread] = None
         self.test_thread: Optional[KaggleTestThread] = None
         self.weights_thread: Optional[KaggleWeightsThread] = None
+        self.gpu_thread: Optional[KaggleGPUCheckThread] = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -223,7 +349,10 @@ class KaggleSettingsDialog(QDialog):
             "The T4 x2 option needs a phone-verified Kaggle account.<br><br>"
             "<b>Models upload once:</b> use <i>Sync weights</i> (or the first "
             "real job). Later jobs send only images + labels and return "
-            "coordinates, which are shown in LabelImg."
+            "coordinates, which are shown in LabelImg.<br><br>"
+            "<b>GPU-only:</b> T4 x2 is tried first. If it stays queued longer "
+            "than the fixed queue timeout, the next accelerator is tried. "
+            "CPU is never used while <i>Require GPU</i> is checked."
         )
         intro.setWordWrap(True)
         intro.setTextInteractionFlags(Qt.TextBrowserInteraction)
@@ -269,6 +398,28 @@ class KaggleSettingsDialog(QDialog):
         self.spin_timeout.setSuffix(" hours")
         form.addRow("Job timeout:", self.spin_timeout)
 
+        self.edit_accels = QLineEdit(",".join(self.cfg.accelerators))
+        self.edit_accels.setToolTip(
+            "Fallback order. T4 x2 first, then L4 x1/H100/A100 if available. "
+            "CPU is not used while 'Require GPU' is checked."
+        )
+        form.addRow("Accelerators:", self.edit_accels)
+
+        self.spin_queue = QDoubleSpinBox()
+        self.spin_queue.setRange(0.5, 60.0)
+        self.spin_queue.setSingleStep(0.5)
+        self.spin_queue.setValue(float(self.cfg.queue_timeout_minutes))
+        self.spin_queue.setSuffix(" min")
+        self.spin_queue.setToolTip(
+            "If an accelerator stays QUEUED for this long, cancel it and try "
+            "the next one. If none starts, the job stops (CPU is not used)."
+        )
+        form.addRow("Queue timeout/GPU:", self.spin_queue)
+
+        self.chk_require_gpu = QCheckBox("Require GPU (never import CPU results)")
+        self.chk_require_gpu.setChecked(bool(self.cfg.require_gpu))
+        form.addRow("", self.chk_require_gpu)
+
         self.chk_force = QCheckBox("Recreate .kaggle-venv if it is broken")
         form.addRow("", self.chk_force)
         layout.addWidget(form_box)
@@ -298,6 +449,15 @@ class KaggleSettingsDialog(QDialog):
         )
         self.btn_weights.clicked.connect(self.start_weights)
         buttons.addWidget(self.btn_weights)
+
+        self.btn_gpu_check = QPushButton("Check GPUs")
+        self.btn_gpu_check.setObjectName("secondaryButton")
+        self.btn_gpu_check.setToolTip(
+            "Run tiny probe kernels to see which accelerators actually give a "
+            "GPU. Nothing is changed locally."
+        )
+        self.btn_gpu_check.clicked.connect(self.start_gpu_check)
+        buttons.addWidget(self.btn_gpu_check)
         buttons.addStretch(1)
 
         self.btn_save = QPushButton("Save")
@@ -312,8 +472,9 @@ class KaggleSettingsDialog(QDialog):
 
     # ------------------------------------------------------------------
     def _busy(self, busy: bool) -> None:
-        for widget in (self.btn_venv, self.btn_test, self.btn_weights, self.btn_save,
-                       self.btn_cancel, self.chk_force):
+        for widget in (self.btn_venv, self.btn_test, self.btn_weights,
+                       self.btn_gpu_check, self.btn_save, self.btn_cancel,
+                       self.chk_force):
             widget.setEnabled(not busy)
 
     def _append(self, text: str) -> None:
@@ -382,6 +543,38 @@ class KaggleSettingsDialog(QDialog):
         self._append(message)
         QMessageBox.warning(self, "Kaggle weights failed", message)
 
+    def start_gpu_check(self) -> None:
+        if self.gpu_thread is not None and self.gpu_thread.isRunning():
+            return
+        accelerators = [
+            part.strip()
+            for part in self.edit_accels.text().split(",")
+            if part.strip() and part.strip().lower() != "cpu"
+        ]
+        if not accelerators:
+            QMessageBox.warning(
+                self, "GPU check", "Enter at least one GPU accelerator."
+            )
+            return
+        self._append("Checking GPUs with tiny probe kernels (up to 45s each)...")
+        self.gpu_thread = KaggleGPUCheckThread(
+            accelerators, wait_seconds=45, parent=self
+        )
+        self.gpu_thread.log.connect(self._append)
+        self.gpu_thread.done.connect(self.on_gpu_check_done)
+        self.gpu_thread.failed.connect(self.on_gpu_check_failed)
+        self.gpu_thread.finished.connect(lambda: self._busy(False))
+        self._busy(True)
+        self.gpu_thread.start()
+
+    def on_gpu_check_done(self, message: str) -> None:
+        self._append(message)
+        QMessageBox.information(self, "GPU check result", message)
+
+    def on_gpu_check_failed(self, message: str) -> None:
+        self._append(message)
+        QMessageBox.warning(self, "GPU check failed", message)
+
     def save_and_close(self) -> None:
         updates: Dict[str, str] = {}
         username = self.edit_username.text().strip()
@@ -407,6 +600,21 @@ class KaggleSettingsDialog(QDialog):
         updates["KAGGLE_DATASET_PREFIX"] = self.edit_prefix.text().strip() or "labelimg-plus-job"
         updates["KAGGLE_POLL_SECONDS"] = str(self.spin_poll.value())
         updates["KAGGLE_TIMEOUT_HOURS"] = str(self.spin_timeout.value())
+        require_gpu = self.chk_require_gpu.isChecked()
+        accelerators = [
+            part.strip()
+            for part in self.edit_accels.text().split(",")
+            if part.strip() and not (require_gpu and part.strip().lower() == "cpu")
+        ]
+        if not accelerators:
+            QMessageBox.warning(
+                self, "Kaggle setup", "Enter at least one accelerator."
+            )
+            return
+        updates["KAGGLE_ACCELERATORS"] = ",".join(accelerators)
+        updates["KAGGLE_QUEUE_TIMEOUT_MINUTES"] = str(self.spin_queue.value())
+        updates["KAGGLE_REQUIRE_GPU"] = "true" if require_gpu else "false"
+        updates["KAGGLE_CPU_FALLBACK"] = "false" if require_gpu else "true"
         try:
             upsert_env_file(self.cfg.env_path, updates)
         except OSError as exc:
@@ -419,6 +627,7 @@ class KaggleSettingsDialog(QDialog):
             (self.setup_thread is not None and self.setup_thread.isRunning())
             or (self.test_thread is not None and self.test_thread.isRunning())
             or (self.weights_thread is not None and self.weights_thread.isRunning())
+            or (self.gpu_thread is not None and self.gpu_thread.isRunning())
         )
         if running:
             QMessageBox.information(

@@ -69,6 +69,16 @@ class MetadataTests(unittest.TestCase):
             ["alice/labelimg-plus-job", "alice/labelimg-plus-weights"],
         )
 
+    def test_kernel_cpu_fallback(self):
+        meta = kernel_metadata(
+            "alice/labelimg-plus-run-job",
+            "LabelImg Plus Run job",
+            "alice/labelimg-plus-job",
+            accelerator="cpu",
+        )
+        self.assertFalse(meta["enable_gpu"])
+        self.assertEqual(meta["machine_shape"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

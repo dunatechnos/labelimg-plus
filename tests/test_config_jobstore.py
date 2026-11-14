@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from kaggle_bridge.config import (
+    load_config,
     parse_env_file,
     upsert_env_file,
 )
@@ -30,6 +31,35 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(values["B"], "hello world")
             self.assertEqual(values["C"], "x#y")
             self.assertEqual(values["D"], "value")
+
+    def test_accelerator_fallback_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".env"
+            path.write_text(
+                "KAGGLE_ACCELERATORS=NvidiaTeslaT4,NvidiaL4\n"
+                "KAGGLE_CPU_FALLBACK=true\n"
+                "KAGGLE_REQUIRE_GPU=true\n"
+                "KAGGLE_QUEUE_TIMEOUT_MINUTES=7\n",
+                encoding="utf-8",
+            )
+            cfg = load_config(root=root, env_path=path)
+            self.assertEqual(
+                cfg.accelerators,
+                ["NvidiaTeslaT4", "NvidiaL4"],
+            )
+            self.assertTrue(cfg.require_gpu)
+            self.assertEqual(cfg.queue_timeout_minutes, 7)
+
+            path.write_text(
+                "KAGGLE_ACCELERATORS=NvidiaTeslaT4,NvidiaL4\n"
+                "KAGGLE_CPU_FALLBACK=true\n"
+                "KAGGLE_REQUIRE_GPU=false\n",
+                encoding="utf-8",
+            )
+            cfg = load_config(root=root, env_path=path)
+            self.assertIn("cpu", cfg.accelerators)
+            self.assertFalse(cfg.require_gpu)
 
     def test_upsert_preserves_comments(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -100,6 +100,7 @@ def cmd_status(args) -> int:
     print(f"Session:    {record.get('session_dataset')}")
     print(f"Kernel:     {record.get('kernel_ref')}")
     print(f"Kernel run: {record.get('kernel_run_ref')}")
+    print(f"Accelerator: {record.get('accelerator')}")
     print(f"Message:    {record.get('message')}")
     if record.get("error"):
         print("Error:")
@@ -233,6 +234,42 @@ def cmd_doctor(args) -> int:
     return run_doctor(load_config(), check_auth=not args.no_auth)
 
 
+def cmd_cancel(args) -> int:
+    cfg = load_config()
+    store = JobStore(cfg.job_root)
+    try:
+        record = store.load(args.job)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    ref = record.get("kernel_run_ref") or record.get("kernel_ref")
+    if not ref:
+        store.update(
+            args.job,
+            state="cancelled",
+            progress=0,
+            message="Cancelled before a remote kernel was created.",
+            error=None,
+        )
+        print("No remote kernel to stop; local job marked cancelled.")
+        return 0
+    try:
+        cli = KaggleCLI(cfg, log=print)
+        cli.cancel_kernel(str(ref))
+    except Exception as exc:
+        print(f"ERROR: could not cancel {ref}: {exc}", file=sys.stderr)
+        return 1
+    store.update(
+        args.job,
+        state="cancelled",
+        progress=0,
+        message="Cancelled by user.",
+        error=None,
+    )
+    print(f"Cancelled remote kernel {ref}")
+    return 0
+
+
 def cmd_session_cleanup(args) -> int:
     cfg = load_config()
     log = None if args.quiet else print
@@ -284,6 +321,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--username", default="", help="Kaggle username (auto-detected)")
     p.set_defaults(func=cmd_sync_weights)
+
+    p = sub.add_parser(
+        "cancel",
+        help="Stop a queued/running Kaggle kernel for a local job",
+    )
+    p.add_argument("--job", required=True)
+    p.set_defaults(func=cmd_cancel)
 
     p = sub.add_parser(
         "session-cleanup",

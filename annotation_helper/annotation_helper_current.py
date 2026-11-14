@@ -1238,6 +1238,12 @@ class AnnotationApp(QWidget):
         self.kaggle_status.setWordWrap(True)
         compute_v.addWidget(self.kaggle_status)
 
+        self.kaggle_mode_info = QLabel("")
+        self.kaggle_mode_info.setObjectName("statusLabel")
+        self.kaggle_mode_info.setWordWrap(True)
+        self.kaggle_mode_info.setStyleSheet("font-size: 8.5pt; color: #6b7280;")
+        compute_v.addWidget(self.kaggle_mode_info)
+
         kaggle_row = QHBoxLayout()
         kaggle_row.setSpacing(6)
         self.btn_kaggle_setup = QPushButton("Kaggle setup")
@@ -1250,6 +1256,16 @@ class AnnotationApp(QWidget):
         self.btn_kaggle_jobs.clicked.connect(self.open_kaggle_jobs)
         kaggle_row.addWidget(self.btn_kaggle_jobs)
         compute_v.addLayout(kaggle_row)
+
+        self.btn_kaggle_cancel = QPushButton("Cancel Kaggle job")
+        self.btn_kaggle_cancel.setObjectName("dangerButton")
+        self.btn_kaggle_cancel.setEnabled(False)
+        self.btn_kaggle_cancel.setToolTip(
+            "Stop the queued/running Kaggle kernel. Images already uploaded "
+            "stay in the session until LabelImg closes."
+        )
+        self.btn_kaggle_cancel.clicked.connect(self.cancel_kaggle_job)
+        compute_v.addWidget(self.btn_kaggle_cancel)
 
         left_layout.addWidget(compute_group)
 
@@ -2426,6 +2442,14 @@ class AnnotationApp(QWidget):
                 self.btn_kaggle_jobs.setEnabled(False)
             return
         _cfg, blockers = self._kaggle_blockers()
+        if _cfg is not None:
+            mode = "GPU only" if _cfg.require_gpu else "GPU/CPU allowed"
+            self.kaggle_mode_info.setText(
+                f"{mode} · {' → '.join(_cfg.accelerators)} · "
+                f"{_cfg.queue_timeout_minutes:g} min each"
+            )
+        else:
+            self.kaggle_mode_info.setText("")
         if blockers:
             self.kaggle_status.setText("Kaggle: setup needed")
             self.kaggle_status.setToolTip("\n".join(blockers))
@@ -2771,24 +2795,63 @@ class AnnotationApp(QWidget):
             lambda job_id: self.kaggle_status.setText(f"Kaggle job: {job_id}")
         )
         thread.done.connect(self.on_kaggle_done)
+        thread.cancelled.connect(self.on_kaggle_cancelled)
         thread.failed.connect(self.on_kaggle_failed)
         thread.finished.connect(lambda: self._on_kaggle_thread_finished(thread))
 
     def _start_kaggle_thread(self, thread, label):
         self.kaggle_thread = thread
         self.set_action_controls_enabled(False)
+        self.btn_kaggle_cancel.setEnabled(True)
         self.btn_predict.setText("Running on Kaggle...")
         self.btn_apply.setText("Running on Kaggle...")
         self.progress_bar.setValue(0)
         self.kaggle_status.setText(f"Kaggle: preparing {label}...")
         self.label_status.setText(
-            f"Kaggle: {label} — packing frames and uploading to T4 x2..."
+            f"Kaggle: {label} — preparing session/command..."
         )
         thread.start()
+
+    def cancel_kaggle_job(self):
+        thread = self.kaggle_thread
+        if thread is None or not thread.isRunning():
+            self.label_status.setText("No Kaggle job is running.")
+            self.btn_kaggle_cancel.setEnabled(False)
+            return
+        answer = QMessageBox.question(
+            self,
+            "Cancel Kaggle job",
+            "Stop the queued/running Kaggle kernel?\n\n"
+            "Already uploaded session images stay until LabelImg closes. "
+            "The local labels will not be changed by a cancelled job.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.btn_kaggle_cancel.setEnabled(False)
+        self.kaggle_status.setText("Kaggle: cancelling...")
+        self.label_status.setText(
+            "Cancelling Kaggle job... waiting for the remote kernel to stop."
+        )
+        thread.cancel()
+
+    def on_kaggle_cancelled(self, message):
+        self.progress_bar.setValue(0)
+        self.set_action_controls_enabled(True)
+        self.btn_kaggle_cancel.setEnabled(False)
+        self.kaggle_status.setText("Kaggle: cancelled")
+        self.label_status.setText(message or "Kaggle job cancelled.")
+        QMessageBox.information(
+            self,
+            "Kaggle job cancelled",
+            "Kaggle job cancelled. Local labels were not changed.",
+        )
 
     def _on_kaggle_thread_finished(self, thread):
         if self.kaggle_thread is thread:
             self.kaggle_thread = None
+        self.btn_kaggle_cancel.setEnabled(False)
         if getattr(self, "chk_kaggle", None) is not None:
             self.chk_kaggle.setEnabled(KAGGLE_UI_AVAILABLE)
         self.btn_predict.setText(

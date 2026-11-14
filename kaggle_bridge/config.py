@@ -33,6 +33,13 @@ DEFAULT_WEIGHTS_ROOT = "kaggle_weights"
 DEFAULT_KERNEL_SLUG = "labelimg-plus-runner"
 DEFAULT_SESSION_PREFIX = "labelimg-plus-session"
 DEFAULT_MAX_SESSION_GB = 20.0
+DEFAULT_QUEUE_TIMEOUT_MINUTES = 5.0
+DEFAULT_ACCELERATORS = (
+    "NvidiaTeslaT4",       # T4 x2 (Kaggle has no separate x1 T4 option)
+    "NvidiaL4X1",          # currently resolves to T4 x2 on this account
+    "NvidiaH100",          # currently resolves to T4 x2 on this account
+    "NvidiaTeslaA100",     # may queue; tried before giving up
+)
 KAGGLE_VENV_DIR = ".kaggle-venv"
 KAGGLE_JOB_DIR = "kaggle_jobs"
 
@@ -213,6 +220,11 @@ class Config:
     session_dataset_prefix: str = DEFAULT_SESSION_PREFIX
     max_session_gb: float = DEFAULT_MAX_SESSION_GB
     session_keep_local: bool = False
+    accelerators: List[str] = field(
+        default_factory=lambda: list(DEFAULT_ACCELERATORS)
+    )
+    queue_timeout_minutes: float = DEFAULT_QUEUE_TIMEOUT_MINUTES
+    require_gpu: bool = True
     poll_seconds: int = DEFAULT_POLL_SECONDS
     timeout_hours: float = DEFAULT_TIMEOUT_HOURS
     delete_dataset_after: bool = True
@@ -283,7 +295,9 @@ class Config:
             f"use weights dataset: {self.use_weights_dataset}",
             f"session dataset: {self.use_session_dataset}",
             f"fixed kernel: {self.kernel_slug if self.fixed_kernel else '(per job)'}",
-            f"accelerator: {self.accelerator}",
+            f"accelerators: {', '.join(self.accelerators)}",
+            f"queue timeout: {self.queue_timeout_minutes} min",
+            f"require GPU (no CPU): {self.require_gpu}",
         ]
         return lines
 
@@ -468,6 +482,35 @@ def _config_from_env(root: Path, env_path: Path) -> Config:
     )
     cfg.session_keep_local = _truthy(
         cfg.get("KAGGLE_SESSION_KEEP_LOCAL"), False
+    )
+    raw_acc = (
+        cfg.get("KAGGLE_ACCELERATORS", "").strip()
+        or cfg.get("KAGGLE_ACCELERATOR", "").strip()
+        or ",".join(DEFAULT_ACCELERATORS)
+    )
+    accelerators = [part.strip() for part in raw_acc.split(",") if part.strip()]
+    cfg.require_gpu = _truthy(cfg.get("KAGGLE_REQUIRE_GPU"), True)
+    if not cfg.require_gpu and _truthy(cfg.get("KAGGLE_CPU_FALLBACK"), False):
+        accelerators.append("cpu")
+    seen_acc = set()
+    cfg.accelerators = []
+    for acc in accelerators:
+        key = acc.lower()
+        if key == "cpu" and cfg.require_gpu:
+            continue
+        if key in seen_acc:
+            continue
+        seen_acc.add(key)
+        cfg.accelerators.append("cpu" if key == "cpu" else acc)
+    if not cfg.accelerators:
+        cfg.accelerators = list(DEFAULT_ACCELERATORS)
+    cfg.accelerator = cfg.accelerators[0]
+    cfg.queue_timeout_minutes = max(
+        0.0,
+        _as_float(
+            cfg.get("KAGGLE_QUEUE_TIMEOUT_MINUTES"),
+            DEFAULT_QUEUE_TIMEOUT_MINUTES,
+        ),
     )
     cfg.poll_seconds = max(5, _as_int(cfg.get("KAGGLE_POLL_SECONDS"), DEFAULT_POLL_SECONDS))
     cfg.timeout_hours = max(

@@ -58,6 +58,7 @@ annotation_helper/sam2_models/
 annotation_helper/models/
 models/
 # Datasets / bulk media (never commit)
+Dset/
 Dataset_new/
 dataset2/
 merged_data/

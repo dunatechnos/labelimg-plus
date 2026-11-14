@@ -101,6 +101,7 @@ def kernel_metadata(
         raise ValueError("kernel title must be at least 5 characters")
     if "/" not in dataset_id:
         raise ValueError(f"invalid dataset id: {dataset_id!r}")
+    is_cpu = not accelerator or str(accelerator).strip().lower() == "cpu"
     sources = [dataset_id]
     for source in extra_dataset_sources or []:
         if not source:
@@ -119,10 +120,10 @@ def kernel_metadata(
         "language": "python",
         "kernel_type": "script",
         "is_private": True,
-        "enable_gpu": True,
+        "enable_gpu": not is_cpu,
         "enable_tpu": False,
         "enable_internet": bool(enable_internet),
-        "machine_shape": accelerator,
+        "machine_shape": "" if is_cpu else accelerator,
         "dataset_sources": sources,
         "competition_sources": [],
         "kernel_sources": [],

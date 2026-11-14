@@ -379,6 +379,22 @@ def load_manifest(job_dir: Path) -> Dict[str, Any]:
     return manifest
 
 
+def _gpu_info(torch) -> tuple[int, list[str]]:
+    try:
+        if not torch.cuda.is_available():
+            return 0, []
+        count = int(torch.cuda.device_count())
+        names = []
+        for index in range(count):
+            try:
+                names.append(str(torch.cuda.get_device_name(index)))
+            except Exception:
+                names.append("unknown")
+        return count, names
+    except Exception:
+        return 0, []
+
+
 def imread(path: Path):
     import cv2
     import numpy as np
@@ -551,6 +567,7 @@ def run_yolo(manifest: Dict[str, Any], job_dir: Path) -> Dict[str, Any]:
         skipped = sum(skipped_classes.values())
         detail = ", ".join(f"{key} x{value}" for key, value in sorted(skipped_classes.items()))
         message += f" Skipped {skipped} box(es) with classes not in classes.txt: {detail}."
+    gpu_count, gpu_names = _gpu_info(torch)
     return {
         "labels": updates,
         "message": message,
@@ -560,7 +577,8 @@ def run_yolo(manifest: Dict[str, Any], job_dir: Path) -> Dict[str, Any]:
             "boxes": total_boxes,
             "skipped_classes": skipped_classes,
             "classes": classes,
-            "gpu_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+            "gpu_count": gpu_count,
+            "gpu_names": gpu_names,
         },
     }
 
@@ -745,6 +763,7 @@ def run_sam2(manifest: Dict[str, Any], job_dir: Path) -> Dict[str, Any]:
         f"updated {updated_frames} label file(s); "
         f"skipped {skipped_low_confidence} low-confidence detection(s)."
     )
+    gpu_count, gpu_names = _gpu_info(torch)
     return {
         "labels": updates,
         "message": message,
@@ -755,7 +774,8 @@ def run_sam2(manifest: Dict[str, Any], job_dir: Path) -> Dict[str, Any]:
             "objects": len(obj_classes),
             "skipped_low_confidence": skipped_low_confidence,
             "device": device,
-            "gpu_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+            "gpu_count": gpu_count,
+            "gpu_names": gpu_names,
         },
     }
 

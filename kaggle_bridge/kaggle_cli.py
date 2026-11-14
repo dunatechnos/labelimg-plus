@@ -378,18 +378,13 @@ class KaggleCLI:
     # ------------------------------------------------------------------
     # Kernels
     # ------------------------------------------------------------------
-    def kernels_push(self, folder: Path, accelerator: str = "NvidiaTeslaT4") -> CliResult:
-        result = self._run(
-            [
-                "kernels",
-                "push",
-                "-p",
-                str(folder),
-                "--accelerator",
-                accelerator,
-            ],
-            timeout=900,
-        )
+    def kernels_push(
+        self, folder: Path, accelerator: Optional[str] = "NvidiaTeslaT4"
+    ) -> CliResult:
+        args = ["kernels", "push", "-p", str(folder)]
+        if accelerator and str(accelerator).strip().lower() != "cpu":
+            args += ["--accelerator", str(accelerator)]
+        result = self._run(args, timeout=900)
         text = result.output.lower()
         if "kernel push error" in text:
             raise KaggleCliError(
@@ -473,3 +468,15 @@ class KaggleCLI:
 
     def kernels_delete(self, ref: str) -> None:
         self._run(["kernels", "delete", ref, "-y"], timeout=180, check=True)
+
+    def cancel_kernel(self, ref: str) -> None:
+        """Stop a queued/running kernel.
+
+        Kaggle's public CLI has no separate cancel command; deleting the
+        kernel stops the session.  The fixed kernel is recreated on the next
+        click.  A version suffix is stripped because delete takes owner/slug.
+        """
+        parts = [part for part in str(ref).strip().split("/") if part]
+        if len(parts) >= 2:
+            ref = "/".join(parts[:2])
+        self.kernels_delete(ref)

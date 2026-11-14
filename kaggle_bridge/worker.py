@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -63,6 +64,10 @@ class JobCancelled(RuntimeError):
     pass
 
 
+class QueueTimeout(RuntimeError):
+    """The GPU stayed queued longer than the configured timeout."""
+
+
 @dataclass
 class JobResult:
     job_id: str
@@ -85,6 +90,7 @@ class KaggleJobRunner:
         log: LogFn = None,
         snapshot: SnapshotFn = None,
         sleep_fn: Callable[[float], None] = time.sleep,
+        cancel_event: Optional[threading.Event] = None,
     ):
         self.cfg = cfg
         self.store = store
@@ -93,7 +99,15 @@ class KaggleJobRunner:
         self.log_cb = log
         self.snapshot_cb = snapshot
         self.sleep = sleep_fn
+        self.cancel_event = cancel_event or threading.Event()
         self._cli: Optional[KaggleCLI] = None
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def _check_cancel(self) -> None:
+        if self.cancel_event.is_set():
+            raise JobCancelled("Cancelled by user.")
 
     # ------------------------------------------------------------------
     # Callbacks / state
@@ -153,6 +167,7 @@ class KaggleJobRunner:
         self.store.acquire_lock(job_id)
         kernel_ref: Optional[str] = None
         try:
+            self._check_cancel()
             self._log(f"Starting Kaggle job {job_id} ({spec.job_type})", job_id)
             cli = KaggleCLI(self.cfg, log=lambda msg: self._log(msg, job_id))
             self._cli = cli
@@ -354,53 +369,120 @@ class KaggleJobRunner:
             finally:
                 if not self.cfg.keep_bundle:
                     shutil.rmtree(dataset_dir, ignore_errors=True)
+            self._check_cancel()
 
             # ----------------------------------------------------------
-            # 3. Kernel
+            # 3-5. Kernel attempts with accelerator fallback
             # ----------------------------------------------------------
-            self._update(
-                job_id,
-                state="pushing_kernel",
-                progress=60,
-                message="Pushing Kaggle kernel (T4 x2)...",
-            )
-            kernel_dir = self._prepare_kernel_folder(
-                job_id,
-                dataset_id,
-                kernel_id,
-                extra_dataset_sources=[weights_dataset_id] if weights_dataset_id else [],
-            )
-            push_result = cli.kernels_push(
-                kernel_dir, accelerator=self.cfg.accelerator
-            )
-            self._update(
-                job_id,
-                state="queued",
-                progress=63,
-                kernel_ref=kernel_id,
-                kernel_url=f"https://www.kaggle.com/code/{kernel_id}",
-                message="Kernel queued on Kaggle (T4 x2).",
-            )
-            self._log(push_result.output, job_id)
-
-            # ----------------------------------------------------------
-            # 4. Poll
-            # ----------------------------------------------------------
-            status = self._wait_for_kernel(job_id, cli, kernel_id, spec)
-            if not status.success:
-                logs = self._fetch_kernel_logs(job_id, cli, kernel_id)
-                raise KaggleJobError(
-                    "Kaggle kernel did not complete successfully: "
-                    f"{status.state}. {status.failure or ''}\n{logs}".strip(),
+            last_error: Optional[Exception] = None
+            for accelerator in self.cfg.accelerators:
+                self._check_cancel()
+                label = (
+                    "CPU"
+                    if str(accelerator).lower() == "cpu"
+                    else str(accelerator)
+                )
+                self._update(
                     job_id,
-                    self.store.job_dir(job_id) / "logs" / "kernel.log",
+                    state="pushing_kernel",
+                    progress=60,
+                    accelerator=accelerator,
+                    message=f"Pushing Kaggle kernel on {label}...",
+                )
+                kernel_dir = self._prepare_kernel_folder(
+                    job_id,
+                    dataset_id,
+                    kernel_id,
+                    extra_dataset_sources=(
+                        [weights_dataset_id] if weights_dataset_id else []
+                    ),
+                    accelerator=accelerator,
+                )
+                try:
+                    push_result = cli.kernels_push(
+                        kernel_dir, accelerator=accelerator
+                    )
+                except KaggleCliError as exc:
+                    last_error = exc
+                    self._log(
+                        f"Accelerator {label} could not be used: {exc}", job_id
+                    )
+                    continue
+                version = self._parse_kernel_version(push_result.output)
+                kernel_run_ref = (
+                    f"{kernel_id}/{version}" if version else kernel_id
+                )
+                self._update(
+                    job_id,
+                    state="queued",
+                    progress=63,
+                    kernel_ref=kernel_id,
+                    kernel_run_ref=kernel_run_ref,
+                    accelerator=accelerator,
+                    kernel_url=f"https://www.kaggle.com/code/{kernel_id}",
+                    message=(
+                        f"Kernel version {version} queued on {label}."
+                        if version
+                        else f"Kernel queued on {label}."
+                    ),
+                )
+                self._log(push_result.output, job_id)
+                try:
+                    status = self._wait_for_kernel(
+                        job_id,
+                        cli,
+                        kernel_run_ref,
+                        spec,
+                        queue_timeout_minutes=self.cfg.queue_timeout_minutes,
+                    )
+                except QueueTimeout as exc:
+                    last_error = exc
+                    self._log(
+                        f"{label} queue timeout; trying the next accelerator.",
+                        job_id,
+                    )
+                    try:
+                        cli.cancel_kernel(kernel_id)
+                    except Exception as cancel_exc:
+                        self._log(
+                            f"Could not cancel queued kernel: {cancel_exc}",
+                            job_id,
+                        )
+                    continue
+                if not status.success:
+                    logs = self._fetch_kernel_logs(
+                        job_id, cli, kernel_run_ref
+                    )
+                    raise KaggleJobError(
+                        "Kaggle kernel did not complete successfully: "
+                        f"{status.state}. {status.failure or ''}\n{logs}".strip(),
+                        job_id,
+                        self.store.job_dir(job_id) / "logs" / "kernel.log",
+                    )
+                return self._download_and_import(
+                    job_id, spec, cli, kernel_run_ref
                 )
 
-            # ----------------------------------------------------------
-            # 5. Download + import
-            # ----------------------------------------------------------
-            return self._download_and_import(job_id, spec, cli, kernel_id)
+            raise self._no_accelerator_error(job_id, last_error)
 
+        except JobCancelled as exc:
+            try:
+                record = self.store.load(job_id)
+                ref = record.get("kernel_run_ref") or record.get("kernel_ref") or kernel_ref
+                if ref:
+                    cli = self._cli or KaggleCLI(self.cfg)
+                    cli.cancel_kernel(ref)
+                    self._log(f"Cancelled remote kernel {ref}", job_id)
+            except Exception as cancel_exc:
+                self._log(f"Could not cancel remote kernel: {cancel_exc}", job_id)
+            self._update(
+                job_id,
+                state="cancelled",
+                progress=0,
+                message=str(exc),
+                error=None,
+            )
+            raise
         except KaggleJobError as exc:
             self._mark_failed(job_id, str(exc))
             raise
@@ -475,7 +557,13 @@ class KaggleJobRunner:
                 state="running" if status.state == "RUNNING" else "queued",
                 message=f"Kernel {status.state.lower()} on Kaggle.",
             )
-            final = self._wait_for_kernel(job_id, cli, run_ref, spec)
+            final = self._wait_for_kernel(
+                job_id,
+                cli,
+                run_ref,
+                spec,
+                queue_timeout_minutes=self.cfg.queue_timeout_minutes,
+            )
             if not final.success:
                 logs = self._fetch_kernel_logs(job_id, cli, run_ref)
                 raise KaggleJobError(
@@ -511,6 +599,7 @@ class KaggleJobRunner:
         weights_dataset_id: Optional[str],
         model_override: Optional[Dict[str, Any]],
     ) -> JobResult:
+        self._check_cancel()
         self._update(
             job_id,
             state="bundling",
@@ -532,6 +621,7 @@ class KaggleJobRunner:
             progress=session_progress,
             username=username,
         )
+        self._check_cancel()
         self._update(
             job_id,
             progress=50,
@@ -554,50 +644,107 @@ class KaggleJobRunner:
             message="Command ready; pushing it to the fixed Kaggle kernel...",
         )
 
-        kernel_dir = self._prepare_kernel_folder_session(
-            job_id,
-            info.dataset_ref,
-            kernel_id,
-            fixed_title,
-            command,
-            weights_dataset_id,
-        )
-        self._update(
-            job_id,
-            state="pushing_kernel",
-            progress=60,
-            message="Pushing fixed Kaggle kernel (T4 x2)...",
-        )
-        push_result = cli.kernels_push(
-            kernel_dir, accelerator=self.cfg.accelerator
-        )
-        version = self._parse_kernel_version(push_result.output)
-        kernel_run_ref = f"{kernel_id}/{version}" if version else kernel_id
-        self._update(
-            job_id,
-            state="queued",
-            progress=63,
-            kernel_ref=kernel_id,
-            kernel_run_ref=kernel_run_ref,
-            kernel_url=f"https://www.kaggle.com/code/{kernel_id}",
-            message=(
-                f"Kernel version {version} queued on Kaggle (T4 x2)."
-                if version
-                else "Kernel queued on Kaggle (T4 x2)."
-            ),
-        )
-        self._log(push_result.output, job_id)
-
-        status = self._wait_for_kernel(job_id, cli, kernel_run_ref, spec)
-        if not status.success:
-            logs = self._fetch_kernel_logs(job_id, cli, kernel_run_ref)
-            raise KaggleJobError(
-                "Kaggle kernel did not complete successfully: "
-                f"{status.state}. {status.failure or ''}\n{logs}".strip(),
+        last_error: Optional[Exception] = None
+        for accelerator in self.cfg.accelerators:
+            self._check_cancel()
+            label = "CPU" if str(accelerator).lower() == "cpu" else str(accelerator)
+            self._update(
                 job_id,
-                self.store.job_dir(job_id) / "logs" / "kernel.log",
+                state="pushing_kernel",
+                progress=60,
+                accelerator=accelerator,
+                message=f"Pushing fixed Kaggle kernel on {label}...",
             )
-        return self._download_and_import(job_id, spec, cli, kernel_run_ref)
+            kernel_dir = self._prepare_kernel_folder_session(
+                job_id,
+                info.dataset_ref,
+                kernel_id,
+                fixed_title,
+                command,
+                weights_dataset_id,
+                accelerator=accelerator,
+            )
+            try:
+                push_result = cli.kernels_push(
+                    kernel_dir, accelerator=accelerator
+                )
+            except KaggleCliError as exc:
+                last_error = exc
+                self._log(
+                    f"Accelerator {label} could not be used: {exc}", job_id
+                )
+                continue
+            version = self._parse_kernel_version(push_result.output)
+            kernel_run_ref = f"{kernel_id}/{version}" if version else kernel_id
+            self._update(
+                job_id,
+                state="queued",
+                progress=63,
+                kernel_ref=kernel_id,
+                kernel_run_ref=kernel_run_ref,
+                accelerator=accelerator,
+                kernel_url=f"https://www.kaggle.com/code/{kernel_id}",
+                message=(
+                    f"Kernel version {version} queued on {label}."
+                    if version
+                    else f"Kernel queued on {label}."
+                ),
+            )
+            self._log(push_result.output, job_id)
+            try:
+                status = self._wait_for_kernel(
+                    job_id,
+                    cli,
+                    kernel_run_ref,
+                    spec,
+                    queue_timeout_minutes=self.cfg.queue_timeout_minutes,
+                )
+            except QueueTimeout as exc:
+                last_error = exc
+                self._log(
+                    f"{label} queue timeout; trying the next accelerator.",
+                    job_id,
+                )
+                try:
+                    cli.cancel_kernel(kernel_id)
+                except Exception as cancel_exc:
+                    self._log(f"Could not cancel queued kernel: {cancel_exc}", job_id)
+                continue
+            if not status.success:
+                logs = self._fetch_kernel_logs(job_id, cli, kernel_run_ref)
+                raise KaggleJobError(
+                    "Kaggle kernel did not complete successfully: "
+                    f"{status.state}. {status.failure or ''}\n{logs}".strip(),
+                    job_id,
+                    self.store.job_dir(job_id) / "logs" / "kernel.log",
+                )
+            return self._download_and_import(job_id, spec, cli, kernel_run_ref)
+
+        raise self._no_accelerator_error(job_id, last_error)
+
+    def _no_accelerator_error(
+        self, job_id: str, last_error: Optional[Exception]
+    ) -> KaggleJobError:
+        if self.cfg.require_gpu:
+            message = (
+                "No usable GPU was allocated. "
+                f"Tried: {', '.join(self.cfg.accelerators)} "
+                f"({self.cfg.queue_timeout_minutes:.0f} min max each). "
+                "CPU fallback is disabled (KAGGLE_REQUIRE_GPU=true), so the "
+                "job stopped and local labels were not changed. Retry later "
+                "or add an available GPU to KAGGLE_ACCELERATORS."
+            )
+        else:
+            message = (
+                "No accelerator could start the kernel. "
+                f"Tried: {', '.join(self.cfg.accelerators)}. "
+                "CPU fallback was allowed but did not start."
+            )
+        if last_error:
+            message += f" Last error: {last_error}"
+        return KaggleJobError(
+            message, job_id, self.store.log_path(job_id)
+        )
 
     def _prepare_kernel_folder_session(
         self,
@@ -607,6 +754,7 @@ class KaggleJobRunner:
         fixed_title: str,
         command: Dict[str, Any],
         weights_dataset_id: Optional[str],
+        accelerator: str,
     ) -> Path:
         kernel_dir = self.store.kernel_dir(job_id)
         shutil.rmtree(kernel_dir, ignore_errors=True)
@@ -624,7 +772,7 @@ class KaggleJobRunner:
                 fixed_title,
                 session_dataset,
                 code_file="runner.py",
-                accelerator=self.cfg.accelerator,
+                accelerator=accelerator,
                 extra_dataset_sources=extra,
             ),
         )
@@ -660,6 +808,7 @@ class KaggleJobRunner:
         dataset_id: str,
         kernel_id: str,
         extra_dataset_sources: Optional[List[str]] = None,
+        accelerator: Optional[str] = None,
     ) -> Path:
         kernel_dir = self.store.kernel_dir(job_id)
         shutil.rmtree(kernel_dir, ignore_errors=True)
@@ -675,7 +824,7 @@ class KaggleJobRunner:
                 kernel_title(job_id),
                 dataset_id,
                 code_file="runner.py",
-                accelerator=self.cfg.accelerator,
+                accelerator=accelerator or self.cfg.accelerator,
                 extra_dataset_sources=extra_dataset_sources,
             ),
         )
@@ -690,23 +839,52 @@ class KaggleJobRunner:
         cli: KaggleCLI,
         kernel_ref: str,
         spec: JobSpec,
+        queue_timeout_minutes: Optional[float] = None,
     ) -> KernelStatus:
         started = time.time()
         deadline = started + max(0.25, self.cfg.timeout_hours) * 3600
         expected = max(300.0, min(3600.0, len(spec.images) * 2.0 + 300.0))
         last_state = ""
+        queued_since: Optional[float] = None
         while time.time() < deadline:
+            self._check_cancel()
             status = cli.kernels_status(kernel_ref)
             if status.state != last_state:
                 last_state = status.state
                 self._log(f"Kernel status: {status.state}", job_id)
             if status.state in ("QUEUED", "RUNNING"):
                 elapsed = time.time() - started
-                percent = 63 + int(22 * min(1.0, elapsed / expected))
-                message = (
-                    f"Kaggle {status.state.lower()} "
-                    f"({int(elapsed // 60)}m {int(elapsed % 60)}s elapsed)"
-                )
+                if status.state == "QUEUED":
+                    if queued_since is None:
+                        queued_since = time.time()
+                    if (
+                        queue_timeout_minutes is not None
+                        and queue_timeout_minutes > 0
+                        and time.time() - queued_since
+                        > queue_timeout_minutes * 60
+                    ):
+                        raise QueueTimeout(
+                            f"Kernel stayed QUEUED for more than "
+                            f"{queue_timeout_minutes:.0f} minutes."
+                        )
+                    percent = 63
+                    max_text = (
+                        f", max {queue_timeout_minutes:.0f}m per accelerator"
+                        if queue_timeout_minutes
+                        else ""
+                    )
+                    message = (
+                        "Kaggle queued — waiting for accelerator allocation "
+                        f"({int(elapsed // 60)}m {int(elapsed % 60)}s elapsed"
+                        f"{max_text}). Use Cancel Kaggle job to stop."
+                    )
+                else:
+                    queued_since = None
+                    percent = 65 + int(20 * min(1.0, elapsed / expected))
+                    message = (
+                        f"Kaggle running "
+                        f"({int(elapsed // 60)}m {int(elapsed % 60)}s elapsed)"
+                    )
                 self._update(
                     job_id,
                     state="running" if status.state == "RUNNING" else "queued",
@@ -774,6 +952,25 @@ class KaggleJobRunner:
     def _import_only(
         self, job_id: str, spec: JobSpec, output_dir: Path
     ) -> JobResult:
+        self._check_cancel()
+        if self.cfg.require_gpu:
+            meta = load_import_metadata(self.store.job_dir(job_id))
+            if meta.get("status") == "ok":
+                stats = meta.get("stats") or {}
+                gpu_count = int(stats.get("gpu_count") or 0)
+                gpu_names = list(stats.get("gpu_names") or [])
+                if gpu_count <= 0:
+                    raise KaggleJobError(
+                        "Kaggle ran the kernel on CPU, but GPU is required "
+                        "(KAGGLE_REQUIRE_GPU=true). No labels were imported. "
+                        "CPU fallback is disabled; retry when a GPU is available.",
+                        job_id,
+                        self.store.log_path(job_id),
+                    )
+                self._log(
+                    f"Kernel GPU: {', '.join(gpu_names) or (str(gpu_count) + ' GPU(s)')}",
+                    job_id,
+                )
         self._update(
             job_id,
             state="importing",
