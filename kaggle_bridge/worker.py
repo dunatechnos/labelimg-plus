@@ -729,7 +729,7 @@ class KaggleJobRunner:
             message = (
                 "No usable GPU was allocated. "
                 f"Tried: {', '.join(self.cfg.accelerators)} "
-                f"({self.cfg.queue_timeout_minutes:.0f} min max each). "
+                f"({self.cfg.queue_timeout_minutes:g} min max each). "
                 "CPU fallback is disabled (KAGGLE_REQUIRE_GPU=true), so the "
                 "job stopped and local labels were not changed. Retry later "
                 "or add an available GPU to KAGGLE_ACCELERATORS."
@@ -869,7 +869,7 @@ class KaggleJobRunner:
                         )
                     percent = 63
                     max_text = (
-                        f", max {queue_timeout_minutes:.0f}m per accelerator"
+                        f", max {queue_timeout_minutes:g}m per accelerator"
                         if queue_timeout_minutes
                         else ""
                     )

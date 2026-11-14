@@ -65,11 +65,13 @@ Enabled by default (`KAGGLE_USE_SESSION_DATASET=true`):
    immediately (deletes that kernel; the next click recreates it).
 4. **GPU-only fallback:** T4 x2 → L4 x1 → H100 → A100.  Kaggle has no
    separate single-T4 option: `NvidiaTeslaT4` is always T4 x2.  Each
-   accelerator gets **`KAGGLE_QUEUE_TIMEOUT_MINUTES` = 5** fixed; if it is
-   still queued, the bridge cancels it and tries the next.  If none starts,
-   the job **stops** with a clear LabelImg error.  CPU is never used.
-   The **Check GPUs** button probes the accelerators with tiny kernels and
-   shows the actual GPU names (or CPU/queued) before you run a real job.
+   accelerator gets **`KAGGLE_QUEUE_TIMEOUT_MINUTES` = 1** by default
+   (fast mode); if it is still queued, the bridge cancels it and tries the
+   next.  If none starts, the job **stops** with a clear LabelImg error.
+   CPU is never used.  The **Check GPUs** button runs a **20-second** probe
+   per accelerator and shows the actual GPU names (or CPU/queued).
+   Kaggle has no public "is a GPU free right now?" API: the only way to know
+   is to request a kernel, which is exactly what the probe/job does.
 5. The fixed kernel `labelimg-plus-runner` is reused; each click creates a
    new version (visible in Kaggle, no kernel spam).
 6. On app close, the session dataset is deleted from Kaggle.  The weights
@@ -295,7 +297,7 @@ The helper's **Jobs... -> Resume selected** does the same from the UI.
 | `KAGGLE_MAX_SESSION_GB` | `20` | Refuse a session images upload larger than this. |
 | `KAGGLE_SESSION_KEEP_LOCAL` | `false` | Keep the local session zip after upload. |
 | `KAGGLE_ACCELERATORS` | `NvidiaTeslaT4,NvidiaL4X1,NvidiaH100,NvidiaTeslaA100` | GPU fallback order. |
-| `KAGGLE_QUEUE_TIMEOUT_MINUTES` | `5` | Fixed per-accelerator queue wait before switching. |
+| `KAGGLE_QUEUE_TIMEOUT_MINUTES` | `1` | Fixed per-accelerator queue wait (0.5-5 recommended). |
 | `KAGGLE_REQUIRE_GPU` | `true` | If true, never import CPU results and never add CPU. |
 | `KAGGLE_CPU_FALLBACK` | `false` | Only used when `KAGGLE_REQUIRE_GPU=false`. |
 | `KAGGLE_POLL_SECONDS` | `30` | Kernel status poll interval. |
@@ -329,9 +331,10 @@ The helper's **Jobs... -> Resume selected** does the same from the UI.
 - SAM 2 click: about 2 minutes, mostly model loading + tracking.  The SAM 2
   package comes from the local wheel (~15 s instead of a 4-5 minute git build)
   and the checkpoint is reused from the weights dataset.
-- If T4 x2 stays queued for 5 minutes, the bridge automatically tries
-  L4 x1/H100/A100 (if your account is eligible).  If none is allocated, the
-  job stops; CPU is not used (`KAGGLE_REQUIRE_GPU=true`).
+- If T4 x2 stays queued for 1 minute (fast default), the bridge automatically
+  tries L4 x1/H100/A100 (if your account is eligible).  If none is allocated,
+  the job stops; CPU is not used (`KAGGLE_REQUIRE_GPU=true`).  Set
+  `KAGGLE_QUEUE_TIMEOUT_MINUTES=5` for patient mode.
 - The fixed kernel keeps one version per click.  Set
   `KAGGLE_DELETE_KERNEL_AFTER=true` or delete it manually if you do not want
   version history.
@@ -376,7 +379,7 @@ update `kaggle_bridge/kernel_runner.py`.
 
 The Compute card now has **Cancel Kaggle job** (and in the jobs dialog the
 same remote kernel can be stopped).  The bridge gives each accelerator
-`KAGGLE_QUEUE_TIMEOUT_MINUTES` (fixed 5 by default) and then automatically
+`KAGGLE_QUEUE_TIMEOUT_MINUTES` (1 minute fast default) and then automatically
 moves to the next one.  If none starts, the job stops and LabelImg shows
 `No usable GPU was allocated`; CPU is not used.
 
@@ -386,7 +389,7 @@ x2 option.
 
 ### Check GPUs first
 
-**Kaggle setup → Check GPUs** runs tiny private probe kernels for each
+**Kaggle setup → Check GPUs** runs a 20-second tiny private probe for each
 configured accelerator and prints the actual result, e.g.:
 
 ```

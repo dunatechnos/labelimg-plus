@@ -412,7 +412,8 @@ class KaggleSettingsDialog(QDialog):
         self.spin_queue.setSuffix(" min")
         self.spin_queue.setToolTip(
             "If an accelerator stays QUEUED for this long, cancel it and try "
-            "the next one. If none starts, the job stops (CPU is not used)."
+            "the next one. 1 min is the fast default; use 5 for patient mode. "
+            "If none starts, the job stops (CPU is not used)."
         )
         form.addRow("Queue timeout/GPU:", self.spin_queue)
 
@@ -556,9 +557,9 @@ class KaggleSettingsDialog(QDialog):
                 self, "GPU check", "Enter at least one GPU accelerator."
             )
             return
-        self._append("Checking GPUs with tiny probe kernels (up to 45s each)...")
+        self._append("Quick GPU check: up to 20s per accelerator...")
         self.gpu_thread = KaggleGPUCheckThread(
-            accelerators, wait_seconds=45, parent=self
+            accelerators, wait_seconds=20, parent=self
         )
         self.gpu_thread.log.connect(self._append)
         self.gpu_thread.done.connect(self.on_gpu_check_done)

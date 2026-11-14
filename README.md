@@ -40,7 +40,7 @@ private Kaggle weights dataset; the current images folder is uploaded once per
 app session.  Later clicks send only a small command (~0.5-1 KB), reuse the
 fixed kernel, and return only YOLO coordinates.  The changed frame is shown in
 LabelImg (with Undo).  A **Cancel Kaggle job** button stops a queued/running
-kernel.  T4 x2 is tried first; after a fixed 5-minute queue it tries L4 x1,
+kernel.  T4 x2 is tried first; after a fixed 1-minute queue it tries L4 x1,
 H100, then A100.  If no GPU is allocated the job stops (CPU is not used), and
 LabelImg shows the reason.  **Kaggle setup → Check GPUs** probes the actual
 GPUs first.  Closing LabelImg deletes the session image dataset.

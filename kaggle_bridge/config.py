@@ -33,7 +33,7 @@ DEFAULT_WEIGHTS_ROOT = "kaggle_weights"
 DEFAULT_KERNEL_SLUG = "labelimg-plus-runner"
 DEFAULT_SESSION_PREFIX = "labelimg-plus-session"
 DEFAULT_MAX_SESSION_GB = 20.0
-DEFAULT_QUEUE_TIMEOUT_MINUTES = 5.0
+DEFAULT_QUEUE_TIMEOUT_MINUTES = 1.0
 DEFAULT_ACCELERATORS = (
     "NvidiaTeslaT4",       # T4 x2 (Kaggle has no separate x1 T4 option)
     "NvidiaL4X1",          # currently resolves to T4 x2 on this account
