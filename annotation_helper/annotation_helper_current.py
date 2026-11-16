@@ -871,6 +871,69 @@ class ChooseImagesDialog(QDialog):
                 sel.append(r + 1)  # 1-based index
         return sel
 
+
+class SelectClassesDialog(QDialog):
+    """Choose one or more classes; the caller selects all matching boxes."""
+
+    def __init__(self, classes, counts, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select boxes by class")
+        self.resize(380, 460)
+        self._class_count = len(classes)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Check one or more classes. Every box of those classes on the "
+            "current frame will be selected."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.list_classes = QListWidget()
+        for index, name in enumerate(classes):
+            count = int(counts.get(index, 0))
+            suffix = "box" if count == 1 else "boxes"
+            item = QListWidgetItem(f"{index}: {name}   ({count} {suffix})")
+            item.setData(Qt.UserRole, index)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.list_classes.addItem(item)
+        layout.addWidget(self.list_classes, 1)
+
+        quick = QHBoxLayout()
+        btn_all = QPushButton("Select All Classes")
+        btn_all.setObjectName("secondaryButton")
+        btn_all.clicked.connect(self._check_all)
+        quick.addWidget(btn_all)
+        btn_none = QPushButton("Clear")
+        btn_none.setObjectName("secondaryButton")
+        btn_none.clicked.connect(self._clear_all)
+        quick.addWidget(btn_none)
+        quick.addStretch(1)
+        layout.addLayout(quick)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _check_all(self):
+        for row in range(self.list_classes.count()):
+            self.list_classes.item(row).setCheckState(Qt.Checked)
+
+    def _clear_all(self):
+        for row in range(self.list_classes.count()):
+            self.list_classes.item(row).setCheckState(Qt.Unchecked)
+
+    def selected_classes(self):
+        selected = set()
+        for row in range(self.list_classes.count()):
+            item = self.list_classes.item(row)
+            if item.checkState() == Qt.Checked:
+                selected.add(int(item.data(Qt.UserRole)))
+        return selected
+
+
 # ---------------- Main Application ----------------
 class AnnotationApp(QWidget):
     # Emitted when user wants to return to the host LabelImg page
@@ -907,6 +970,7 @@ class AnnotationApp(QWidget):
         self.kaggle_session_thread = None
         self.kaggle_session_info = None
         self._kaggle_cleanup_connected = False
+        self._selection_controls_locked = False
 
 
         self.current_index = 1 if self.images else 0
@@ -1274,9 +1338,46 @@ class AnnotationApp(QWidget):
         sel_group.setObjectName("cardGroup")
         sel_v = QVBoxLayout(sel_group)
 
+        sel_actions = QHBoxLayout()
+        sel_actions.setSpacing(6)
+        self.btn_select_all = QPushButton("Select All")
+        self.btn_select_all.setObjectName("secondaryButton")
+        self.btn_select_all.setToolTip(
+            "Select every bounding box on this frame (all classes). "
+            "Shortcut: Ctrl+Shift+A."
+        )
+        self.btn_select_all.clicked.connect(self.select_all_boxes)
+        sel_actions.addWidget(self.btn_select_all)
+
+        self.btn_select_classes = QPushButton("By Class...")
+        self.btn_select_classes.setObjectName("secondaryButton")
+        self.btn_select_classes.setToolTip(
+            "Check one or more classes and select every matching box at once."
+        )
+        self.btn_select_classes.clicked.connect(self.select_boxes_by_classes)
+        sel_actions.addWidget(self.btn_select_classes)
+
+        self.btn_clear_selection = QPushButton("Clear")
+        self.btn_clear_selection.setObjectName("secondaryButton")
+        self.btn_clear_selection.setToolTip("Deselect all boxes.")
+        self.btn_clear_selection.clicked.connect(self.clear_box_selection)
+        sel_actions.addWidget(self.btn_clear_selection)
+        sel_v.addLayout(sel_actions)
+
+        self.sel_count_label = QLabel("Selected: 0 / 0")
+        self.sel_count_label.setObjectName("statusLabel")
+        sel_v.addWidget(self.sel_count_label)
+
         self.list_selected = QListWidget()
         self.list_selected.setFixedHeight(130)
         sel_v.addWidget(self.list_selected)
+
+        for _btn in (
+            self.btn_select_all,
+            self.btn_select_classes,
+            self.btn_clear_selection,
+        ):
+            _btn.setEnabled(False)
 
         left_layout.addWidget(sel_group)
 
@@ -1633,6 +1734,7 @@ class AnnotationApp(QWidget):
         # connect
         self.safe_connect_scene()
         self.update_sam2_selection_label()
+        self.update_selection_count()
         self.label_status.setText(f"Loaded {name} ({index}/{len(self.images)})")
         # fit by default
         self.fit_view()
@@ -1647,9 +1749,90 @@ class AnnotationApp(QWidget):
             pass
         self.update_selected_panel()
         self.update_sam2_selection_label()
+        self.update_selection_count()
         # update area classes if in change
         if self.get_current_action() == "change" and self.selection_area:
             self.update_area_classes()
+
+    # ---------------- Smart box selection ----------------
+    def _apply_bbox_selection(self, predicate):
+        """Set selection for all boxes in one batch and refresh the UI once."""
+        if not self.bbox_items:
+            self.label_status.setText("No boxes on this frame.")
+            return
+        self.scene.blockSignals(True)
+        try:
+            for item in self.bbox_items:
+                item.setSelected(bool(predicate(item)))
+        finally:
+            self.scene.blockSignals(False)
+        self.on_scene_selection_changed()
+
+    def select_all_boxes(self):
+        if not self.bbox_items:
+            self.label_status.setText("No boxes on this frame.")
+            return
+        self._apply_bbox_selection(lambda item: True)
+        self.label_status.setText(
+            f"Selected all {len(self.bbox_items)} box(es) on this frame."
+        )
+
+    def clear_box_selection(self):
+        self._apply_bbox_selection(lambda item: False)
+        self.label_status.setText("Box selection cleared.")
+
+    def select_boxes_by_classes(self):
+        if not self.bbox_items:
+            self.label_status.setText("No boxes on this frame.")
+            return
+        counts = Counter()
+        for item in self.bbox_items:
+            try:
+                counts[int(float(item.parts[0]))] += 1
+            except (TypeError, ValueError):
+                continue
+        dlg = SelectClassesDialog(self.classes, counts, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        chosen = dlg.selected_classes()
+        self._apply_bbox_selection(
+            lambda item: int(float(item.parts[0])) in chosen
+        )
+        if chosen:
+            names = [
+                self.classes[i] if i < len(self.classes) else str(i)
+                for i in sorted(chosen)
+            ]
+            self.label_status.setText(
+                f"Selected all boxes for: {', '.join(names)}"
+            )
+        else:
+            self.label_status.setText("No classes checked; selection cleared.")
+
+    def update_selection_count(self):
+        if not hasattr(self, "sel_count_label"):
+            return
+        total = len(self.bbox_items)
+        selected = sum(1 for item in self.bbox_items if item.isSelected())
+        classes = set()
+        for item in self.bbox_items:
+            if item.isSelected():
+                try:
+                    classes.add(int(float(item.parts[0])))
+                except (TypeError, ValueError):
+                    pass
+        if total:
+            self.sel_count_label.setText(
+                f"Selected: {selected} / {total} box(es) · {len(classes)} class(es)"
+            )
+        else:
+            self.sel_count_label.setText("Selected: 0 / 0")
+        busy = bool(getattr(self, "_selection_controls_locked", False))
+        has_boxes = total > 0
+        if hasattr(self, "btn_select_all"):
+            self.btn_select_all.setEnabled(has_boxes and not busy)
+            self.btn_select_classes.setEnabled(has_boxes and not busy)
+            self.btn_clear_selection.setEnabled(selected > 0 and not busy)
 
     def update_selected_panel(self):
         self.list_selected.clear()
@@ -2209,6 +2392,7 @@ class AnnotationApp(QWidget):
             print("on_sam2_snapshot error:", e)
 
     def set_action_controls_enabled(self, enabled):
+        self._selection_controls_locked = not enabled
         for widget in (
             self.btn_apply,
             self.btn_predict,
@@ -2223,11 +2407,15 @@ class AnnotationApp(QWidget):
             self.btn_sam2_download,
             self.btn_kaggle_setup,
             self.btn_kaggle_jobs,
+            self.btn_select_all,
+            self.btn_select_classes,
+            self.btn_clear_selection,
         ):
             widget.setEnabled(enabled)
         if hasattr(self, "chk_kaggle"):
             self.chk_kaggle.setEnabled(enabled and KAGGLE_UI_AVAILABLE)
         self.update_apply_button_text()
+        self.update_selection_count()
 
     def on_sam2_done(self, message):
         self.progress_bar.setValue(100)
@@ -2924,6 +3112,8 @@ class AnnotationApp(QWidget):
         undo_shortcut.activated.connect(self.perform_undo)
         fit_shortcut = QShortcut(QKeySequence("Ctrl+0"), self)
         fit_shortcut.activated.connect(self.fit_view)
+        select_all_shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
+        select_all_shortcut.activated.connect(self.select_all_boxes)
 
 # Alias to make embedding name clearer without breaking existing imports
 AnnotationHelperPage = AnnotationApp
