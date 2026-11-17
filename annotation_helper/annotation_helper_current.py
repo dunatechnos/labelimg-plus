@@ -365,13 +365,14 @@ class PredictThread(QThread):
     error = pyqtSignal(str)
     snapshot = pyqtSignal(dict)         # emit files snapshot for undo
 
-    def __init__(self, images, sel_area, model_obj, start_idx, end_idx):
+    def __init__(self, images, sel_area, model_obj, start_idx, end_idx, merge_existing=False):
         super().__init__()
         self.images = images
         self.sel_area = sel_area  # normalized coords or None
         self.model = model_obj
         self.start_idx = start_idx
         self.end_idx = end_idx
+        self.merge_existing = bool(merge_existing)
 
         # Build a name -> index map from classes.txt (our current class list)
         self.our_classes = read_classes()
@@ -466,7 +467,7 @@ class PredictThread(QThread):
                         bymin = yc - bh/2
                         bymax = yc + bh/2
                         A = self.sel_area
-                        if (bxmax < A["xmin"] or bxmin > A["xmax"] or bymax < A["ymin"] or bymin > A["ymax"]):
+                        if self.merge_existing or (bxmax < A["xmin"] or bxmin > A["xmax"] or bymax < A["ymin"] or bymin > A["ymax"]):
                             kept.append(p)
                     final = kept
 
@@ -486,6 +487,7 @@ class PredictThread(QThread):
                         final.append([str(cls), f"{xc:.6f}", f"{yc:.6f}", f"{bw:.6f}", f"{bh:.6f}"] )
 
                 else:
+                    final = read_yolo_labels(name) if self.merge_existing else []
                     results = self.model(img)
                     for b in results[0].boxes:
                         cls = self.remap_cls(int(b.cls[0]))
@@ -515,6 +517,9 @@ class PredictThread(QThread):
             self.finished.emit(updated, msg)
         except Exception as e:
             tb = traceback.format_exc()
+            if files_snapshot:
+                # Keep partial prediction changes undoable too.
+                self.snapshot.emit(files_snapshot)
             self.error.emit(f"Predict thread error: {e}\n{tb}")
 
 # ---------------- SAM 2 Model Download Worker (QThread) ----------------

@@ -18,19 +18,20 @@ Examples:
 * Move to previous / next image
 * Use existing LabelImg shortcuts such as `W` to create a box
 
-### LabelImg-plus (Annotation Helper) Features
+### Main-window Batch Features
 
-Annotation Helper is integrated into the same window and is designed to reduce repetitive work during annotation.
+The former Annotation Helper features are integrated into the normal LabelImg
+window through an **Actions** menu, keyboard shortcuts, and a searchable
+Action Palette. There is no separate helper page.
 
 It helps with:
 
-* deleting labels across an index range
-* propagating labels to later images
+* selecting all boxes, boxes by class, or a canvas area
+* deleting labels across an image range
+* propagating selected boxes to later images
 * changing label classes in bulk
-* running prediction on full images
-* running prediction only inside a selected area
-
-![Annotation Helper Window](assets/annotation_helper-ui.png)
+* running prediction on full images or only inside a selected area
+* SAM 2 tracking and optional Kaggle T4 x2 offload
 
 ### Optional: Kaggle T4 x2 Offload
 
@@ -130,55 +131,44 @@ python labelImg.py images classes.txt
 
 ---
 
-### Annotation Helper Window
+### Main-window Actions
 
-![Annotation Helper Window](assets/annotation_helper-ui.png)
+Every former Annotation Helper feature now lives in the normal LabelImg
+window. There is no separate helper page to open or navigate to.
 
----
+Open the **Actions** menu, use a shortcut, or press `Ctrl+Shift+H` for the
+searchable **Action Palette**. Each action opens a compact dialog with only
+the options it needs.
 
-## How to Open Annotation Helper
+| Action | Shortcut |
+| --- | --- |
+| Select all boxes | `Ctrl+Alt+A` |
+| Select boxes by class | `Ctrl+Shift+B` |
+| Clear selection | `Ctrl+Shift+X` |
+| Select area on canvas | `Ctrl+Alt+R` |
+| Delete boxes | `Ctrl+Alt+D` |
+| Change class | `Ctrl+Shift+C` |
+| Propagate selected boxes | `Ctrl+Alt+F` |
+| YOLO predict | `Ctrl+Shift+Y` |
+| SAM 2 track | `Ctrl+Shift+T` |
+| Kaggle controls | `Ctrl+Shift+K` |
+| Undo last label action | `Ctrl+Alt+Z` |
+| Action Palette | `Ctrl+Shift+H` |
+| Keyboard shortcut help | `Ctrl+Shift+F1` |
 
-1. Launch **LabelImg Plus**
-2. Open your dataset as usual
-3. Click **Annotation Helper** from the top menu
-4. The Annotation Helper UI will open inside the same window
-5. Click **Home** from the top menu to return to the normal LabelImg page
+### Selection
 
----
+* Click a box to select it.
+* `Ctrl+click` adds or removes a box from the multi-selection.
+* The status bar shows `Selected: N box(es)`.
+* `Ctrl+Alt+R` starts area mode; drag a rectangle on the image and release.
+  `Esc` cancels area mode.
+* Delete, Change, Propagate, Predict and SAM 2 can all use the current
+  selection or the orange canvas area as a filter.
 
-## Annotation Helper Overview
-
-The Annotation Helper page includes:
-
-* **Image Navigation**
-
-  * `Index`
-  * `End`
-  * `Load`
-
-* **Select Area Mode**
-
-  * used when you want to work only on a specific region
-
-* **Actions**
-
-  * Delete
-  * Propagate
-  * Change Class
-
-* **Model & Predict**
-
-  * model selector
-  * Reload Models
-  * Predict
-
-* **Selected boxes**
-
-  * shows currently selected bounding boxes
-
-* **Undo**
-
-  * restores the last performed helper action
+All Actions read and write **YOLO `.txt`** labels. The app switches to the
+YOLO format automatically and keeps `classes.txt` in sync with the main
+window before saving.
 
 ---
 
@@ -197,13 +187,11 @@ Use this when you want to delete:
 
 ### Steps
 
-1. Open **Annotation Helper**
-2. Enter the start image in **Index**
-3. Enter the last image in **End**
-4. In the image, select the target bounding box if needed
-5. Choose **Delete**
-6. If you want to delete by class, use the available class selection
-7. Click **Apply Action**
+1. Open the **Actions** menu (or use the shortcut)
+2. Choose the target frames (current frame, range, or all)
+3. Select the target bounding box(es) on the canvas if needed
+4. Choose the class / selection / area filters
+5. Click the action button in the compact dialog
 
 ### Typical use cases
 
@@ -218,12 +206,11 @@ Use this when there are many objects of the same class, but you want to delete o
 
 ### Steps
 
-1. Open **Annotation Helper**
-2. Set **Index** and **End**
-3. Enable **Select Area Mode**
-4. Draw a small box around the specific object you want to target
-5. Choose **Delete**
-6. Click **Apply Action**
+1. Open the **Actions** menu (or use the shortcut)
+2. Choose the target frames (current frame, range, or all)
+3. Press `Ctrl+Alt+R` and drag a small box around the specific object
+4. Open **Delete boxes** and keep the area filter checked
+5. Click the action button in the compact dialog
 
 ### Why this is useful
 
@@ -251,12 +238,10 @@ Examples:
 
 ### Steps
 
-1. Open **Annotation Helper**
-2. Set **Index** to the current image
-3. Set **End** to the last target image
-4. Select the bounding box you want to copy forward
-5. Choose **Propagate**
-6. Click **Apply Action**
+1. Open the **Actions** menu (or use the shortcut)
+2. Select the bounding box(es) you want to copy forward
+3. Choose the target frame range, or use **Choose frames...** in the dialog
+4. Click the action button in the compact dialog
 
 ### Result
 
@@ -287,13 +272,12 @@ A `person` was accidentally labeled as `dog`.
 
 ### Steps
 
-1. Open **Annotation Helper**
-2. Set **Index** and **End**
-3. Choose **Change Class**
-4. Select the wrong class in **Old Class**
-5. Select the correct class in **New Class**
-6. If needed, select the specific box directly in the image
-7. Click **Apply Action**
+1. Open the **Actions** menu (or use the shortcut)
+2. Choose the target frames (current frame, range, or all)
+3. Select the wrong class in **Old class**
+4. Select the correct class in **New class**
+5. If needed, select the specific box(es) on the canvas first
+6. Click the action button in the compact dialog
 
 
 ## 3B. Change Only One Specific Object Using Select Area Mode
@@ -302,14 +286,11 @@ Use this when there are many labels of the same class in the selected range, but
 
 ### Steps
 
-1. Open **Annotation Helper**
-2. Set **Index** and **End**
-3. Enable **Select Area Mode**
-4. Draw a small box around the specific object
-5. Choose **Change Class**
-6. Select **Old Class**
-7. Select **New Class**
-8. Click **Apply Action**
+1. Open the **Actions** menu (or use the shortcut)
+2. Choose the target frames (current frame, range, or all)
+3. Press `Ctrl+Alt+R` and drag a small box around the specific object
+4. Open **Change class** and keep the area filter checked
+5. Select **New class** and click the action button
 
 ### Why this is useful
 
@@ -334,16 +315,17 @@ Use this when you want to run prediction on the full image.
 
 ### Steps
 
-1. Open **Annotation Helper**
-2. Set **Index** and **End**
-3. In **Model & Predict**, choose a model from the dropdown
-4. If your model is not listed, click **Reload Models**
-5. Keep **Select Area Mode** turned off
-6. Click **Predict**
+1. Open the **Actions** menu (or use the shortcut)
+2. Choose the target frame range
+3. Choose a model from the dropdown in the dialog
+4. If your model is not listed, use **Browse...**
+5. Leave the area filter unchecked
+6. Click **Run predict**
 
 ### Result
 
 Prediction runs on the full image for all images in the selected range.
+Tick **Keep existing boxes and add predictions** to merge instead of replace.
 
 ---
 
@@ -353,13 +335,12 @@ Use this when you want to run prediction only inside a selected region.
 
 ### Steps
 
-1. Open **Annotation Helper**
-2. Set **Index** and **End**
-3. Enable **Select Area Mode**
-4. Draw a box around the target region
-5. Select a model from the **Model** dropdown
-6. If needed, click **Reload Models**
-7. Click **Predict**
+1. Open the **Actions** menu (or use the shortcut)
+2. Choose the target frame range
+3. Press `Ctrl+Alt+R` and drag a box around the target region
+4. Choose a model in the dialog (or use **Browse...**)
+5. Keep the area filter checked
+6. Click **Run predict**
 
 ### Result
 
@@ -372,6 +353,17 @@ This is helpful when:
 * the image has many unrelated objects
 * you only want to detect in one region
 * you want better control over prediction area
+
+### SAM 2 and Kaggle
+
+* `Ctrl+Shift+T` opens SAM 2 tracking for the selected box(es).
+* `Ctrl+Shift+K` opens Kaggle settings, job history, session upload, and
+  connection/GPU checks.
+* Tick **Run on Kaggle** inside the Predict or SAM 2 dialog to run the job on
+  a T4 x2 kernel. Images are uploaded once per batch; later clicks send only
+  the command.
+* **Undo last label action** (`Ctrl+Alt+Z`) restores the previous label-file
+  snapshot after any local or Kaggle batch action.
 
 ## LabelImg Shortcuts
 
@@ -408,7 +400,7 @@ Developed and maintained by **Duna Keshav Rao**
 
 This version extends the original LabelImg with advanced features such as:
 
-* Annotation Helper
+* main-window batch actions and shortcuts
 * Batch operations (Delete, Propagate, Change Class)
 * YOLO-based prediction system
 * Improved UI workflow and integrated tools

@@ -54,6 +54,7 @@ from libs.create_ml_io import CreateMLReader
 from libs.create_ml_io import JSON_EXT
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
+from main_actions.controller import MainActionController
 
 __appname__ = 'labelImg'
 
@@ -208,6 +209,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.newShape.connect(self.new_shape)
         self.canvas.shapeMoved.connect(self.set_dirty)
         self.canvas.selectionChanged.connect(self.shape_selection_changed)
+        self.canvas.selectionChanged.connect(lambda _selected: self.update_selection_count())
         self.canvas.drawingPolygon.connect(self.toggle_drawing_sensitive)
 
         # Central content uses a QStackedWidget so we can swap between LabelImg and the helper page
@@ -428,16 +430,10 @@ class MainWindow(QMainWindow, WindowMixin):
             recentFiles=QMenu(get_str('menu_openRecent')),
             labelList=label_menu)
 
-        actHelper = QAction("Annotation Helper", self)
-        actHelper.triggered.connect(self.show_annotation_helper_page)
-        self.menuBar().addAction(actHelper)
-        actHelperBack = QAction("Home", self)
-        actHelperBack.triggered.connect(self.show_labelimg_page)
-        # Place Home on the menu bar row, immediately before the Edit menu (right after File).
-        self.menuBar().insertAction(self.menus.edit.menuAction(), actHelperBack)
-        # --- END Annotation Helper button ---
+        # Annotation Helper is now accessed through main-window Actions
+        # shortcuts/dialogs (see main_actions).  The old page stays in the
+        # codebase as a hidden fallback but is not exposed in the menu bar.
 
-    
         # Auto saving : Enable auto saving if pressing next
         self.auto_saving = QAction(get_str('autoSaveMode'), self)
         self.auto_saving.setCheckable(True)
@@ -563,6 +559,8 @@ class MainWindow(QMainWindow, WindowMixin):
         # Display cursor coordinates at the right of status bar
         self.label_coordinates = QLabel('')
         self.statusBar().addPermanentWidget(self.label_coordinates)
+        self.label_selection_count = QLabel('')
+        self.statusBar().addPermanentWidget(self.label_selection_count)
 
         # Open Dir if default file
         if self.file_path and os.path.isdir(self.file_path):
@@ -574,6 +572,10 @@ class MainWindow(QMainWindow, WindowMixin):
         self.jump_timer.start(400)
         # Track LabelImg-specific chrome (toolbars/docks) so we can hide them when showing the helper page.
         self._labelimg_chrome = self._collect_labelimg_chrome_widgets()
+
+        # Annotation Helper features are exposed directly from this window:
+        # Actions menu, keyboard shortcuts, compact dialogs and a palette.
+        self.action_controller = MainActionController(self)
 
     def get_helper_paths(self):
         """Resolve images/labels/models paths for the embedded helper."""
@@ -1026,15 +1028,31 @@ class MainWindow(QMainWindow, WindowMixin):
             pass
 
     # React to canvas signals.
+    def update_selection_count(self):
+        try:
+            count = len(getattr(self.canvas, "selected_shapes", []) or [])
+        except RuntimeError:
+            count = 0
+        self.label_selection_count.setText(
+            ("Selected: %d box(es)" % count) if count else ""
+        )
+
     def shape_selection_changed(self, selected=False):
         if self._no_selection_slot:
             self._no_selection_slot = False
         else:
-            shape = self.canvas.selected_shape
-            if shape:
-                self.shapes_to_items[shape].setSelected(True)
-            else:
-                self.label_list.clearSelection()
+            # Selecting the primary item in the label list must not collapse
+            # a Ctrl+click multi-selection on the canvas.  The list itself
+            # stays single-select; the status bar shows the full count.
+            self.label_list.blockSignals(True)
+            try:
+                shape = self.canvas.selected_shape
+                if shape:
+                    self.shapes_to_items[shape].setSelected(True)
+                else:
+                    self.label_list.clearSelection()
+            finally:
+                self.label_list.blockSignals(False)
         self.actions.delete.setEnabled(selected)
         self.actions.copy.setEnabled(selected)
         self.actions.edit.setEnabled(selected)
@@ -1413,6 +1431,14 @@ class MainWindow(QMainWindow, WindowMixin):
             txt_path = os.path.join(self.default_save_dir, basename + TXT_EXT)
             json_path = os.path.join(self.default_save_dir, basename + JSON_EXT)
 
+            # YOLO is the format used by the main-window batch actions.
+            # While it is active, never let an old XML file win over the
+            # .txt labels that the actions just edited.
+            if self.label_file_format == LabelFileFormat.YOLO:
+                if os.path.isfile(txt_path):
+                    self.load_yolo_txt_by_filename(txt_path)
+                return
+
             """Annotation file priority:
             PascalXML > YOLO
             """
@@ -1427,6 +1453,11 @@ class MainWindow(QMainWindow, WindowMixin):
             xml_path = os.path.splitext(file_path)[0] + XML_EXT
             txt_path = os.path.splitext(file_path)[0] + TXT_EXT
             json_path = os.path.splitext(file_path)[0] + JSON_EXT
+
+            if self.label_file_format == LabelFileFormat.YOLO:
+                if os.path.isfile(txt_path):
+                    self.load_yolo_txt_by_filename(txt_path)
+                return
 
             if os.path.isfile(xml_path):
                 self.load_pascal_xml_by_filename(xml_path)
@@ -1573,8 +1604,9 @@ class MainWindow(QMainWindow, WindowMixin):
         if not self.may_continue():
             return
 
-        default_open_dir_path = dir_path if dir_path else '.'
-        if self.last_open_dir and os.path.exists(self.last_open_dir):
+        if dir_path:
+            default_open_dir_path = dir_path
+        elif self.last_open_dir and os.path.exists(self.last_open_dir):
             default_open_dir_path = self.last_open_dir
         else:
             default_open_dir_path = os.path.dirname(self.file_path) if self.file_path else '.'
@@ -1587,6 +1619,14 @@ class MainWindow(QMainWindow, WindowMixin):
         self.last_open_dir = target_dir_path
         self.import_dir_images(target_dir_path)
         self.default_save_dir = target_dir_path
+        # This app's batch layout keeps images/ and labels/ side by side.
+        # When the user opens an images/ folder, load/save the sibling labels
+        # folder so the normal LabelImg view and the Actions menu agree.
+        if os.path.basename(os.path.normpath(target_dir_path)).lower() == 'images':
+            sibling_labels = os.path.join(
+                os.path.dirname(os.path.normpath(target_dir_path)), 'labels')
+            if os.path.isdir(sibling_labels):
+                self.default_save_dir = sibling_labels
         if self.file_path:
             self.show_bounding_box_from_annotation_file(file_path=self.file_path)
 
@@ -1801,7 +1841,9 @@ class MainWindow(QMainWindow, WindowMixin):
             self.set_dirty()
 
     def delete_selected_shape(self):
-        self.remove_label(self.canvas.delete_selected())
+        deleted = self.canvas.delete_selected()
+        for shape in deleted or []:
+            self.remove_label(shape)
         self.set_dirty()
         if self.no_shapes():
             for action in self.actions.onShapesPresent:
