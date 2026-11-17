@@ -181,18 +181,20 @@ GPU quota:    30.00h remaining of 30.00h
 Everything looks ready.
 ```
 
-### 2.5 Use it from the helper
+### 2.5 Use it from the main window
 
-1. Open Annotation Helper on a batch (`images/` + `labels/`).
-2. Tick **Run heavy work on Kaggle (T4 x2)** in the **Compute** card.
-3. For predict: choose a YOLO model, then **Predict on Kaggle**.
-4. For tracking: select one or more boxes, choose **Propagate > Dynamic
-   SAM 2**, then **Start SAM 2 on Kaggle**.
-5. The job uploads, runs, downloads and merges automatically.  `Ctrl+Z`
+1. Open a batch (`images/` + `labels/`) in the normal LabelImg window.
+2. Press `Ctrl+Shift+K` for **Kaggle controls** (settings, jobs, session
+   upload, connection and GPU checks).
+3. For predict: press `Ctrl+Shift+Y`, choose a YOLO model, tick **Run on
+   Kaggle (T4 x2)**, then **Run predict**.
+4. For tracking: select one or more boxes, press `Ctrl+Shift+T`, choose the
+   SAM 2 model/direction, tick **Run on Kaggle**, then **Start tracking**.
+5. The job uploads, runs, downloads and merges automatically.  `Ctrl+Alt+Z`
    restores every label file changed by the import.
 
-The **Kaggle setup** button opens the token / CLI / connection-test dialog.
-The **Jobs...** button opens local job history and a **Resume selected**
+The **Kaggle settings** button opens the token / CLI / connection-test dialog.
+The **Job history** button opens local job history and a **Resume selected**
 button for interrupted jobs.
 
 ---
