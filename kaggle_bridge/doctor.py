@@ -151,9 +151,10 @@ def doctor_lines(
         lines.append("Everything looks ready.")
     lines.append("")
     lines.append("Next steps:")
-    lines.append("  1. In Annotation Helper, tick 'Run on Kaggle (T4 x2)'.")
-    lines.append("  2. Select boxes (SAM 2) or a YOLO model (Predict).")
-    lines.append("  3. Click Predict / Start SAM 2. Results merge back automatically.")
+    lines.append("  1. Open the main window and press Ctrl+Shift+K for Kaggle controls.")
+    lines.append("  2. Use Ctrl+Shift+Y (Predict) or Ctrl+Shift+T (SAM 2).")
+    lines.append("  3. Tick 'Run on Kaggle (T4 x2)' and start the job.")
+    lines.append("     Results merge back automatically; Ctrl+Alt+Z undoes them.")
     return lines, problems
 
 

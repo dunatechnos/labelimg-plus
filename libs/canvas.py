@@ -29,6 +29,7 @@ class Canvas(QWidget):
     selectionChanged = pyqtSignal(bool)
     shapeMoved = pyqtSignal()
     drawingPolygon = pyqtSignal(bool)
+    areaSelected = pyqtSignal(dict)
 
     CREATE, EDIT = list(range(2))
 
@@ -40,8 +41,13 @@ class Canvas(QWidget):
         self.mode = self.EDIT
         self.shapes = []
         self.current = None
-        self.selected_shape = None  # save the selected shape here
+        self.selected_shape = None  # primary/last selected shape (back-compat)
+        self.selected_shapes = []   # multi-selection
         self.selected_shape_copy = None
+        self.area_mode = False
+        self.area_start = None
+        self.area_rect = None
+        self.area_value = None
         self.drawing_line_color = QColor(0, 0, 255)
         self.drawing_rect_color = QColor(0, 0, 255)
         self.line = Shape(line_color=self.drawing_line_color)
@@ -117,6 +123,14 @@ class Canvas(QWidget):
         if window.file_path is not None:
             self.parent().window().label_coordinates.setText(
                 'X: %d; Y: %d' % (pos.x(), pos.y()))
+
+        if self.area_mode:
+            if self.area_start is not None:
+                end = self._clamp_to_pixmap(pos)
+                self.area_rect = QRectF(self.area_start, end).normalized()
+                self.update()
+            self.override_cursor(CURSOR_DRAW)
+            return
 
         # Polygon drawing.
         if self.drawing():
@@ -258,14 +272,25 @@ class Canvas(QWidget):
     def mousePressEvent(self, ev):
         pos = self.transform_pos(ev.pos())
 
+        if self.area_mode and ev.button() == Qt.LeftButton:
+            pos = self._clamp_to_pixmap(pos)
+            self.area_start = pos
+            self.area_rect = QRectF(pos, pos)
+            self.area_value = None
+            self.override_cursor(CURSOR_DRAW)
+            self.update()
+            return
+
         if ev.button() == Qt.LeftButton:
             if self.drawing():
                 self.handle_drawing(pos)
             else:
-                selection = self.select_shape_point(pos)
-                self.prev_point = pos
+                additive = bool(ev.modifiers() & Qt.ControlModifier)
+                selection = self.select_shape_point(pos, additive=additive)
+                # Ctrl+click is a selection gesture, never a move gesture.
+                self.prev_point = None if additive else pos
 
-                if selection is None:
+                if selection is None and not additive:
                     # pan
                     QApplication.setOverrideCursor(QCursor(Qt.OpenHandCursor))
                     self.pan_initial_pos = ev.pos()
@@ -276,6 +301,28 @@ class Canvas(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, ev):
+        if self.area_mode and self.area_start is not None and ev.button() == Qt.LeftButton:
+            pos = self._clamp_to_pixmap(self.transform_pos(ev.pos()))
+            rect = QRectF(self.area_start, pos).normalized()
+            self.area_rect = rect
+            self.area_start = None
+            self.area_mode = False
+            self.override_cursor(CURSOR_DEFAULT)
+            w = self.pixmap.width()
+            h = self.pixmap.height()
+            if rect.width() >= 2 and rect.height() >= 2 and w > 0 and h > 0:
+                self.area_value = {
+                    "xmin": max(0.0, min(1.0, rect.left() / w)),
+                    "ymin": max(0.0, min(1.0, rect.top() / h)),
+                    "xmax": max(0.0, min(1.0, rect.right() / w)),
+                    "ymax": max(0.0, min(1.0, rect.bottom() / h)),
+                }
+                self.areaSelected.emit(dict(self.area_value))
+            else:
+                self.area_value = None
+                self.area_rect = None
+            self.update()
+            return
         if ev.button() == Qt.RightButton:
             menu = self.menus[bool(self.selected_shape_copy)]
             self.restore_cursor()
@@ -352,28 +399,120 @@ class Canvas(QWidget):
             self.current.pop_point()
             self.finalise()
 
-    def select_shape(self, shape):
+    def select_shape(self, shape, additive=False):
+        if additive:
+            if shape.selected:
+                shape.selected = False
+                if shape in self.selected_shapes:
+                    self.selected_shapes.remove(shape)
+                if self.selected_shape is shape:
+                    self.selected_shape = (
+                        self.selected_shapes[-1] if self.selected_shapes else None
+                    )
+                self.set_hiding(bool(self.selected_shapes))
+                self.selectionChanged.emit(bool(self.selected_shapes))
+                self.update()
+                return
+            shape.selected = True
+            if shape not in self.selected_shapes:
+                self.selected_shapes.append(shape)
+            self.selected_shape = shape
+            self.set_hiding()
+            self.selectionChanged.emit(True)
+            self.update()
+            return
+
         self.de_select_shape()
         shape.selected = True
+        self.selected_shapes = [shape]
         self.selected_shape = shape
         self.set_hiding()
         self.selectionChanged.emit(True)
         self.update()
 
-    def select_shape_point(self, point):
-        """Select the first shape created which contains this point."""
-        self.de_select_shape()
+    def select_shape_point(self, point, additive=False):
+        """Select the first shape created which contains this point.
+
+        Ctrl+click passes ``additive=True`` and toggles the shape in the
+        multi-selection.
+        """
+        if not additive:
+            self.de_select_shape()
         if self.selected_vertex():  # A vertex is marked for selection.
             index, shape = self.h_vertex, self.h_shape
             shape.highlight_vertex(index, shape.MOVE_VERTEX)
-            self.select_shape(shape)
+            self.select_shape(shape, additive=additive)
             return self.h_vertex
         for shape in reversed(self.shapes):
             if self.isVisible(shape) and shape.contains_point(point):
-                self.select_shape(shape)
-                self.calculate_offsets(shape, point)
+                self.select_shape(shape, additive=additive)
+                if shape.selected:
+                    self.calculate_offsets(shape, point)
                 return self.selected_shape
         return None
+
+    def select_all_shapes(self):
+        self.select_shapes(lambda shape: True)
+
+    def select_shapes(self, predicate):
+        self.de_select_shape()
+        chosen = [shape for shape in self.shapes if predicate(shape)]
+        for shape in chosen:
+            shape.selected = True
+        self.selected_shapes = chosen
+        self.selected_shape = chosen[-1] if chosen else None
+        self.set_hiding(bool(chosen))
+        self.selectionChanged.emit(bool(chosen))
+        self.update()
+
+    def clear_selection(self):
+        self.de_select_shape()
+
+    def _clamp_to_pixmap(self, pos):
+        if self.pixmap.isNull():
+            return pos
+        w, h = self.pixmap.width(), self.pixmap.height()
+        return QPointF(min(max(0.0, pos.x()), w), min(max(0.0, pos.y()), h))
+
+    def set_area_mode(self, enabled=True):
+        self.area_mode = bool(enabled)
+        self.area_start = None
+        if self.area_mode:
+            self.de_select_shape()
+            self.override_cursor(CURSOR_DRAW)
+            self.setFocus()
+        else:
+            self.override_cursor(CURSOR_DEFAULT)
+        self.update()
+
+    def clear_area(self):
+        self.area_mode = False
+        self.area_start = None
+        self.area_rect = None
+        self.area_value = None
+        self.override_cursor(CURSOR_DEFAULT)
+        self.update()
+
+    def set_area_value(self, value):
+        """Restore a normalized area (used after reloading the same frame)."""
+        self.area_mode = False
+        self.area_start = None
+        self.area_value = dict(value) if value else None
+        self.area_rect = None
+        if self.area_value is not None and self.pixmap is not None and not self.pixmap.isNull():
+            try:
+                w = float(self.pixmap.width())
+                h = float(self.pixmap.height())
+                self.area_rect = QRectF(
+                    self.area_value["xmin"] * w,
+                    self.area_value["ymin"] * h,
+                    (self.area_value["xmax"] - self.area_value["xmin"]) * w,
+                    (self.area_value["ymax"] - self.area_value["ymin"]) * h,
+                )
+            except (KeyError, TypeError, ValueError):
+                self.area_value = None
+                self.area_rect = None
+        self.update()
 
     def calculate_offsets(self, shape, point):
         rect = shape.bounding_rect()
@@ -456,21 +595,35 @@ class Canvas(QWidget):
         return False
 
     def de_select_shape(self):
+        had_selection = bool(self.selected_shapes) or self.selected_shape is not None
+        for shape in self.selected_shapes:
+            shape.selected = False
+        self.selected_shapes = []
         if self.selected_shape:
             self.selected_shape.selected = False
             self.selected_shape = None
+        if had_selection:
             self.set_hiding(False)
             self.selectionChanged.emit(False)
             self.update()
 
     def delete_selected(self):
-        if self.selected_shape:
-            shape = self.selected_shape
+        selected = list(self.selected_shapes)
+        if not selected and self.selected_shape:
+            selected = [self.selected_shape]
+        selected = [shape for shape in selected if shape in self.shapes]
+        if not selected:
+            return []
+        for shape in selected:
             self.un_highlight(shape)
-            self.shapes.remove(self.selected_shape)
-            self.selected_shape = None
-            self.update()
-            return shape
+            shape.selected = False
+            self.shapes.remove(shape)
+        self.selected_shapes = []
+        self.selected_shape = None
+        self.set_hiding(False)
+        self.selectionChanged.emit(False)
+        self.update()
+        return selected
 
     def copy_selected_shape(self):
         if self.selected_shape:
@@ -478,8 +631,10 @@ class Canvas(QWidget):
             self.de_select_shape()
             self.shapes.append(shape)
             shape.selected = True
+            self.selected_shapes = [shape]
             self.selected_shape = shape
             self.bounded_shift_shape(shape)
+            self.selectionChanged.emit(True)
             return shape
 
     def bounded_shift_shape(self, shape):
@@ -525,6 +680,12 @@ class Canvas(QWidget):
             self.line.paint(p)
         if self.selected_shape_copy:
             self.selected_shape_copy.paint(p)
+
+        # Selected area overlay (used by Predict/Delete/Change/Propagate).
+        if self.area_rect is not None:
+            p.setPen(QPen(QColor(255, 140, 0), max(1, int(2 / self.scale)), Qt.DashLine))
+            p.setBrush(QBrush(QColor(255, 165, 0, 45)))
+            p.drawRect(self.area_rect)
 
         # Paint rect
         if self.current is not None and len(self.line) == 2:
@@ -628,6 +789,10 @@ class Canvas(QWidget):
 
     def keyPressEvent(self, ev):
         key = ev.key()
+        if key == Qt.Key_Escape and self.area_mode:
+            self.set_area_mode(False)
+            self.update()
+            return
         if key == Qt.Key_Escape and self.current:
             print('ESC press')
             self.current = None
@@ -706,12 +871,23 @@ class Canvas(QWidget):
         self.update()
 
     def load_pixmap(self, pixmap):
+        area = self.area_value
         self.pixmap = pixmap
         self.shapes = []
+        self.selected_shapes = []
+        self.selected_shape = None
+        self.area_mode = False
+        self.area_start = None
+        self.area_rect = None
+        self.area_value = None
+        if area:
+            self.set_area_value(area)
         self.repaint()
 
     def load_shapes(self, shapes):
         self.shapes = list(shapes)
+        self.selected_shapes = []
+        self.selected_shape = None
         self.current = None
         self.repaint()
 
@@ -742,6 +918,10 @@ class Canvas(QWidget):
 
         self.restore_cursor()
         self.pixmap = None
+        self.area_mode = False
+        self.area_start = None
+        self.area_rect = None
+        # Keep area_value so the normalized area survives frame navigation.
         self.update()
 
     def set_drawing_shape_to_square(self, status):
