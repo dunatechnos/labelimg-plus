@@ -13,6 +13,7 @@ import sys
 import cv2
 import time
 import shutil
+import subprocess
 import tempfile
 import traceback
 import urllib.request
@@ -33,6 +34,40 @@ from PyQt5.QtWidgets import (
 
 from PyQt5.QtGui import QImage, QPixmap, QPen, QColor, QKeySequence, QFont
 from PyQt5.QtCore import Qt, QRectF, QPointF, QThread, pyqtSignal
+
+# ---------------------------------------------------------------------------
+# Optional Kaggle cloud offload.  The bridge runs on Python 3.10 too; the
+# Kaggle CLI itself is installed separately in .kaggle-venv.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+KAGGLE_UI_AVAILABLE = False
+KAGGLE_UI_ERROR = ""
+try:
+    from annotation_helper.kaggle_ui import (
+        KaggleJobThread,
+        KaggleJobsDialog,
+        KaggleSessionThread,
+        KaggleSettingsDialog,
+    )
+    from kaggle_bridge.config import load_config
+
+    KAGGLE_UI_AVAILABLE = True
+except Exception as _kaggle_import_error:
+    try:
+        from kaggle_ui import (  # type: ignore
+            KaggleJobThread,
+            KaggleJobsDialog,
+            KaggleSessionThread,
+            KaggleSettingsDialog,
+        )
+        from kaggle_bridge.config import load_config
+
+        KAGGLE_UI_AVAILABLE = True
+    except Exception:
+        KAGGLE_UI_ERROR = str(_kaggle_import_error)
 
 # ultralytics YOLO (ensure installed)
 try:
@@ -836,6 +871,69 @@ class ChooseImagesDialog(QDialog):
                 sel.append(r + 1)  # 1-based index
         return sel
 
+
+class SelectClassesDialog(QDialog):
+    """Choose one or more classes; the caller selects all matching boxes."""
+
+    def __init__(self, classes, counts, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select boxes by class")
+        self.resize(380, 460)
+        self._class_count = len(classes)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Check one or more classes. Every box of those classes on the "
+            "current frame will be selected."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.list_classes = QListWidget()
+        for index, name in enumerate(classes):
+            count = int(counts.get(index, 0))
+            suffix = "box" if count == 1 else "boxes"
+            item = QListWidgetItem(f"{index}: {name}   ({count} {suffix})")
+            item.setData(Qt.UserRole, index)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.list_classes.addItem(item)
+        layout.addWidget(self.list_classes, 1)
+
+        quick = QHBoxLayout()
+        btn_all = QPushButton("Select All Classes")
+        btn_all.setObjectName("secondaryButton")
+        btn_all.clicked.connect(self._check_all)
+        quick.addWidget(btn_all)
+        btn_none = QPushButton("Clear")
+        btn_none.setObjectName("secondaryButton")
+        btn_none.clicked.connect(self._clear_all)
+        quick.addWidget(btn_none)
+        quick.addStretch(1)
+        layout.addLayout(quick)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _check_all(self):
+        for row in range(self.list_classes.count()):
+            self.list_classes.item(row).setCheckState(Qt.Checked)
+
+    def _clear_all(self):
+        for row in range(self.list_classes.count()):
+            self.list_classes.item(row).setCheckState(Qt.Unchecked)
+
+    def selected_classes(self):
+        selected = set()
+        for row in range(self.list_classes.count()):
+            item = self.list_classes.item(row)
+            if item.checkState() == Qt.Checked:
+                selected.add(int(item.data(Qt.UserRole)))
+        return selected
+
+
 # ---------------- Main Application ----------------
 class AnnotationApp(QWidget):
     # Emitted when user wants to return to the host LabelImg page
@@ -868,6 +966,11 @@ class AnnotationApp(QWidget):
         self.active_model = None
         self.custom_target_indices = None    # <-- ADD THIS HERE
         self.sam2_thread = None
+        self.kaggle_thread = None
+        self.kaggle_session_thread = None
+        self.kaggle_session_info = None
+        self._kaggle_cleanup_connected = False
+        self._selection_controls_locked = False
 
 
         self.current_index = 1 if self.images else 0
@@ -888,6 +991,14 @@ class AnnotationApp(QWidget):
         self.build_ui()
         self.on_action_changed("delete")
         self.update_sam2_model_label()
+        self.refresh_kaggle_status()
+
+        # Delete the remote session image dataset when LabelImg exits.  A
+        # previous crashed session is cleaned on the next launch too.
+        app = QApplication.instance()
+        if app is not None and KAGGLE_UI_AVAILABLE and not self._kaggle_cleanup_connected:
+            app.aboutToQuit.connect(self.cleanup_kaggle_session)
+            self._kaggle_cleanup_connected = True
 
         # keyboard shortcuts
         self.setup_shortcuts()
@@ -1172,14 +1283,101 @@ class AnnotationApp(QWidget):
 
         left_layout.addWidget(model_group)
 
+        # --- Compute Group (optional Kaggle T4 x2 offload) ---
+        compute_group = QGroupBox("Compute")
+        compute_group.setObjectName("cardGroup")
+        compute_v = QVBoxLayout(compute_group)
+        compute_v.setSpacing(7)
+
+        self.chk_kaggle = QCheckBox("Run heavy work on Kaggle (T4 x2)")
+        self.chk_kaggle.setToolTip(
+            "Predict and Dynamic SAM 2 are packed, uploaded to Kaggle, run on "
+            "2x T4 GPU, and merged back into this dataset with Undo support."
+        )
+        self.chk_kaggle.toggled.connect(self.on_kaggle_toggled)
+        compute_v.addWidget(self.chk_kaggle)
+
+        self.kaggle_status = QLabel("Kaggle: checking...")
+        self.kaggle_status.setObjectName("statusLabel")
+        self.kaggle_status.setWordWrap(True)
+        compute_v.addWidget(self.kaggle_status)
+
+        self.kaggle_mode_info = QLabel("")
+        self.kaggle_mode_info.setObjectName("statusLabel")
+        self.kaggle_mode_info.setWordWrap(True)
+        self.kaggle_mode_info.setStyleSheet("font-size: 8.5pt; color: #6b7280;")
+        compute_v.addWidget(self.kaggle_mode_info)
+
+        kaggle_row = QHBoxLayout()
+        kaggle_row.setSpacing(6)
+        self.btn_kaggle_setup = QPushButton("Kaggle setup")
+        self.btn_kaggle_setup.setObjectName("secondaryButton")
+        self.btn_kaggle_setup.clicked.connect(self.open_kaggle_settings)
+        kaggle_row.addWidget(self.btn_kaggle_setup)
+
+        self.btn_kaggle_jobs = QPushButton("Jobs...")
+        self.btn_kaggle_jobs.setObjectName("secondaryButton")
+        self.btn_kaggle_jobs.clicked.connect(self.open_kaggle_jobs)
+        kaggle_row.addWidget(self.btn_kaggle_jobs)
+        compute_v.addLayout(kaggle_row)
+
+        self.btn_kaggle_cancel = QPushButton("Cancel Kaggle job")
+        self.btn_kaggle_cancel.setObjectName("dangerButton")
+        self.btn_kaggle_cancel.setEnabled(False)
+        self.btn_kaggle_cancel.setToolTip(
+            "Stop the queued/running Kaggle kernel. Images already uploaded "
+            "stay in the session until LabelImg closes."
+        )
+        self.btn_kaggle_cancel.clicked.connect(self.cancel_kaggle_job)
+        compute_v.addWidget(self.btn_kaggle_cancel)
+
+        left_layout.addWidget(compute_group)
+
         # --- Selected boxes list (kept small) ---
         sel_group = QGroupBox("Selected Boxes")
         sel_group.setObjectName("cardGroup")
         sel_v = QVBoxLayout(sel_group)
 
+        sel_actions = QHBoxLayout()
+        sel_actions.setSpacing(6)
+        self.btn_select_all = QPushButton("Select All")
+        self.btn_select_all.setObjectName("secondaryButton")
+        self.btn_select_all.setToolTip(
+            "Select every bounding box on this frame (all classes). "
+            "Shortcut: Ctrl+Shift+A."
+        )
+        self.btn_select_all.clicked.connect(self.select_all_boxes)
+        sel_actions.addWidget(self.btn_select_all)
+
+        self.btn_select_classes = QPushButton("By Class...")
+        self.btn_select_classes.setObjectName("secondaryButton")
+        self.btn_select_classes.setToolTip(
+            "Check one or more classes and select every matching box at once."
+        )
+        self.btn_select_classes.clicked.connect(self.select_boxes_by_classes)
+        sel_actions.addWidget(self.btn_select_classes)
+
+        self.btn_clear_selection = QPushButton("Clear")
+        self.btn_clear_selection.setObjectName("secondaryButton")
+        self.btn_clear_selection.setToolTip("Deselect all boxes.")
+        self.btn_clear_selection.clicked.connect(self.clear_box_selection)
+        sel_actions.addWidget(self.btn_clear_selection)
+        sel_v.addLayout(sel_actions)
+
+        self.sel_count_label = QLabel("Selected: 0 / 0")
+        self.sel_count_label.setObjectName("statusLabel")
+        sel_v.addWidget(self.sel_count_label)
+
         self.list_selected = QListWidget()
         self.list_selected.setFixedHeight(130)
         sel_v.addWidget(self.list_selected)
+
+        for _btn in (
+            self.btn_select_all,
+            self.btn_select_classes,
+            self.btn_clear_selection,
+        ):
+            _btn.setEnabled(False)
 
         left_layout.addWidget(sel_group)
 
@@ -1435,6 +1633,12 @@ class AnnotationApp(QWidget):
         self.models = scan_models()
         self.refresh_full_class_list()
         self.refresh_models()
+        if (
+            KAGGLE_UI_AVAILABLE
+            and hasattr(self, "chk_kaggle")
+            and self.chk_kaggle.isChecked()
+        ):
+            self.start_kaggle_session_prepare()
         max_count = max(1, len(self.images))
         self.spin_index.setMaximum(max_count)
         self.spin_end.setMaximum(max_count)
@@ -1530,6 +1734,7 @@ class AnnotationApp(QWidget):
         # connect
         self.safe_connect_scene()
         self.update_sam2_selection_label()
+        self.update_selection_count()
         self.label_status.setText(f"Loaded {name} ({index}/{len(self.images)})")
         # fit by default
         self.fit_view()
@@ -1544,9 +1749,90 @@ class AnnotationApp(QWidget):
             pass
         self.update_selected_panel()
         self.update_sam2_selection_label()
+        self.update_selection_count()
         # update area classes if in change
         if self.get_current_action() == "change" and self.selection_area:
             self.update_area_classes()
+
+    # ---------------- Smart box selection ----------------
+    def _apply_bbox_selection(self, predicate):
+        """Set selection for all boxes in one batch and refresh the UI once."""
+        if not self.bbox_items:
+            self.label_status.setText("No boxes on this frame.")
+            return
+        self.scene.blockSignals(True)
+        try:
+            for item in self.bbox_items:
+                item.setSelected(bool(predicate(item)))
+        finally:
+            self.scene.blockSignals(False)
+        self.on_scene_selection_changed()
+
+    def select_all_boxes(self):
+        if not self.bbox_items:
+            self.label_status.setText("No boxes on this frame.")
+            return
+        self._apply_bbox_selection(lambda item: True)
+        self.label_status.setText(
+            f"Selected all {len(self.bbox_items)} box(es) on this frame."
+        )
+
+    def clear_box_selection(self):
+        self._apply_bbox_selection(lambda item: False)
+        self.label_status.setText("Box selection cleared.")
+
+    def select_boxes_by_classes(self):
+        if not self.bbox_items:
+            self.label_status.setText("No boxes on this frame.")
+            return
+        counts = Counter()
+        for item in self.bbox_items:
+            try:
+                counts[int(float(item.parts[0]))] += 1
+            except (TypeError, ValueError):
+                continue
+        dlg = SelectClassesDialog(self.classes, counts, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        chosen = dlg.selected_classes()
+        self._apply_bbox_selection(
+            lambda item: int(float(item.parts[0])) in chosen
+        )
+        if chosen:
+            names = [
+                self.classes[i] if i < len(self.classes) else str(i)
+                for i in sorted(chosen)
+            ]
+            self.label_status.setText(
+                f"Selected all boxes for: {', '.join(names)}"
+            )
+        else:
+            self.label_status.setText("No classes checked; selection cleared.")
+
+    def update_selection_count(self):
+        if not hasattr(self, "sel_count_label"):
+            return
+        total = len(self.bbox_items)
+        selected = sum(1 for item in self.bbox_items if item.isSelected())
+        classes = set()
+        for item in self.bbox_items:
+            if item.isSelected():
+                try:
+                    classes.add(int(float(item.parts[0])))
+                except (TypeError, ValueError):
+                    pass
+        if total:
+            self.sel_count_label.setText(
+                f"Selected: {selected} / {total} box(es) · {len(classes)} class(es)"
+            )
+        else:
+            self.sel_count_label.setText("Selected: 0 / 0")
+        busy = bool(getattr(self, "_selection_controls_locked", False))
+        has_boxes = total > 0
+        if hasattr(self, "btn_select_all"):
+            self.btn_select_all.setEnabled(has_boxes and not busy)
+            self.btn_select_classes.setEnabled(has_boxes and not busy)
+            self.btn_clear_selection.setEnabled(selected > 0 and not busy)
 
     def update_selected_panel(self):
         self.list_selected.clear()
@@ -1755,8 +2041,11 @@ class AnnotationApp(QWidget):
             )
 
     def update_apply_button_text(self):
+        remote = bool(getattr(self, "chk_kaggle", None) and self.chk_kaggle.isChecked())
         if self.radio_propagate.isChecked() and self.radio_prop_sam2.isChecked():
-            self.btn_apply.setText("Start SAM 2 Tracking")
+            self.btn_apply.setText(
+                "Start SAM 2 on Kaggle" if remote else "Start SAM 2 Tracking"
+            )
         else:
             self.btn_apply.setText("Apply Action")
 
@@ -1764,6 +2053,9 @@ class AnnotationApp(QWidget):
     def on_apply_action(self):
         if self.sam2_thread is not None and self.sam2_thread.isRunning():
             self.label_status.setText("SAM 2 tracking is already running.")
+            return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is already running. Wait for it to finish.")
             return
         act = self.get_current_action()
         start_idx = self.current_index
@@ -2008,9 +2300,15 @@ class AnnotationApp(QWidget):
         if self.sam2_thread is not None and self.sam2_thread.isRunning():
             self.label_status.setText("SAM 2 tracking is already running.")
             return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is already running. Wait for it to finish.")
+            return
         predict_thread = getattr(self, "predict_thread", None)
         if predict_thread is not None and predict_thread.isRunning():
             self.label_status.setText("YOLO prediction is running. Wait for it to finish.")
+            return
+        if getattr(self, "chk_kaggle", None) is not None and self.chk_kaggle.isChecked():
+            self.start_kaggle_sam2()
             return
 
         selected = [list(it.parts) for it in self.bbox_items if it.isSelected()]
@@ -2094,6 +2392,7 @@ class AnnotationApp(QWidget):
             print("on_sam2_snapshot error:", e)
 
     def set_action_controls_enabled(self, enabled):
+        self._selection_controls_locked = not enabled
         for widget in (
             self.btn_apply,
             self.btn_predict,
@@ -2106,9 +2405,17 @@ class AnnotationApp(QWidget):
             self.combo_sam2_model,
             self.spin_sam2_conf,
             self.btn_sam2_download,
+            self.btn_kaggle_setup,
+            self.btn_kaggle_jobs,
+            self.btn_select_all,
+            self.btn_select_classes,
+            self.btn_clear_selection,
         ):
             widget.setEnabled(enabled)
+        if hasattr(self, "chk_kaggle"):
+            self.chk_kaggle.setEnabled(enabled and KAGGLE_UI_AVAILABLE)
         self.update_apply_button_text()
+        self.update_selection_count()
 
     def on_sam2_done(self, message):
         self.progress_bar.setValue(100)
@@ -2139,6 +2446,12 @@ class AnnotationApp(QWidget):
     def update_sam2_model_label(self):
         """Show whether the selected SAM 2 model is ready or needs downloading."""
         try:
+            if getattr(self, "chk_kaggle", None) is not None and self.chk_kaggle.isChecked():
+                self.sam2_model_status.setText(
+                    "SAM 2 model: handled by Kaggle T4 x2 (no local download needed)"
+                )
+                self.btn_sam2_download.setVisible(False)
+                return
             key = self.sam2_selected_model_key()
             info = SAM2_MODELS[key]
             if sam2_checkpoint_available(key):
@@ -2214,6 +2527,12 @@ class AnnotationApp(QWidget):
         if self.sam2_thread is not None and self.sam2_thread.isRunning():
             self.label_status.setText("SAM 2 tracking is running. Wait for it to finish.")
             return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is already running. Wait for it to finish.")
+            return
+        if getattr(self, "chk_kaggle", None) is not None and self.chk_kaggle.isChecked():
+            self.start_kaggle_predict()
+            return
         model_name = self.combo_models.currentText()
         if not model_name or model_name == "(no models found)":
             self.label_status.setText("No model selected.")
@@ -2277,12 +2596,524 @@ class AnnotationApp(QWidget):
         self.label_status.setText("Predict error. See console.")
         print(msg)
 
+    # ---------------- Kaggle T4 x2 offload ----------------
+    def _kaggle_blockers(self):
+        if not KAGGLE_UI_AVAILABLE:
+            return None, [KAGGLE_UI_ERROR or "Kaggle bridge is not importable."]
+        try:
+            cfg = load_config()
+        except Exception as exc:
+            return None, [f"Cannot load .env: {exc}"]
+        blockers = []
+        if cfg.find_cli() is None:
+            blockers.append(
+                "Kaggle CLI not installed. Click 'Kaggle setup' and install it."
+            )
+        if cfg.credentials_source() is None:
+            blockers.append(
+                "Kaggle credentials missing. Put kaggle.json in "
+                f"{cfg.kaggle_home} or paste a token in 'Kaggle setup'."
+            )
+        return cfg, blockers
+
+    def refresh_kaggle_status(self):
+        if not hasattr(self, "kaggle_status"):
+            return
+        if not KAGGLE_UI_AVAILABLE:
+            self.kaggle_status.setText("Kaggle: bridge unavailable")
+            self.kaggle_status.setToolTip(KAGGLE_UI_ERROR)
+            if hasattr(self, "chk_kaggle"):
+                self.chk_kaggle.setEnabled(False)
+            if hasattr(self, "btn_kaggle_setup"):
+                self.btn_kaggle_setup.setEnabled(False)
+            if hasattr(self, "btn_kaggle_jobs"):
+                self.btn_kaggle_jobs.setEnabled(False)
+            return
+        _cfg, blockers = self._kaggle_blockers()
+        if _cfg is not None:
+            mode = "GPU only" if _cfg.require_gpu else "GPU/CPU allowed"
+            self.kaggle_mode_info.setText(
+                f"{mode} · {' → '.join(_cfg.accelerators)} · "
+                f"{_cfg.queue_timeout_minutes:g} min each"
+            )
+        else:
+            self.kaggle_mode_info.setText("")
+        if blockers:
+            self.kaggle_status.setText("Kaggle: setup needed")
+            self.kaggle_status.setToolTip("\n".join(blockers))
+        elif self.kaggle_session_thread is not None and self.kaggle_session_thread.isRunning():
+            self.kaggle_status.setText("Kaggle: uploading session images...")
+            self.kaggle_status.setToolTip(
+                "One-time upload of the current images folder. Later clicks "
+                "send only a small command."
+            )
+        elif self.kaggle_session_info is not None:
+            self.kaggle_status.setText(
+                f"Kaggle: session ready ({self.kaggle_session_info.image_count} images)"
+            )
+            self.kaggle_status.setToolTip(
+                "Images are on Kaggle. Each Predict/SAM 2 click sends only the "
+                "command and receives coordinates."
+            )
+        else:
+            self.kaggle_status.setText("Kaggle: ready for T4 x2 jobs")
+            self.kaggle_status.setToolTip(
+                "Tick the checkbox, then use Predict or Dynamic SAM 2. "
+                "Results download and merge automatically."
+            )
+        if hasattr(self, "chk_kaggle") and not self.chk_kaggle.isChecked():
+            self.chk_kaggle.setEnabled(True)
+
+    def start_kaggle_session_prepare(self):
+        """Upload the current images folder once (background, pre-warm)."""
+        if not KAGGLE_UI_AVAILABLE:
+            return
+        if self.kaggle_session_thread is not None and self.kaggle_session_thread.isRunning():
+            return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            return
+        images = list_images()
+        if not images:
+            return
+        thread = KaggleSessionThread(
+            IMAGES_DIR,
+            images,
+            read_classes(),
+            parent=self,
+        )
+        thread.progress.connect(self.on_kaggle_session_progress)
+        thread.status.connect(self.on_kaggle_session_status)
+        thread.done.connect(self.on_kaggle_session_done)
+        thread.failed.connect(self.on_kaggle_session_failed)
+        thread.finished.connect(self._on_kaggle_session_finished)
+        self.kaggle_session_thread = thread
+        self.btn_predict.setEnabled(False)
+        self.btn_apply.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.kaggle_status.setText("Kaggle: uploading session images (one-time)...")
+        self.label_status.setText(
+            "Kaggle: packing/uploading the current images folder once. "
+            "Later clicks will only send a command."
+        )
+        thread.start()
+
+    def on_kaggle_session_progress(self, percent, message):
+        self.progress_bar.setValue(int(percent))
+        self.kaggle_status.setText(f"Kaggle session: {message}")
+
+    def on_kaggle_session_status(self, message):
+        self.kaggle_status.setText(f"Kaggle session: {message}")
+        self.label_status.setText(message)
+
+    def on_kaggle_session_done(self, info):
+        self.kaggle_session_info = info
+        self.progress_bar.setValue(100)
+        self.kaggle_status.setText(
+            f"Kaggle: session ready ({info.image_count} images)"
+        )
+        self.label_status.setText(
+            f"Kaggle session ready: {info.image_count} images uploaded once. "
+            "Predict/SAM 2 clicks will now send only the command."
+        )
+
+    def on_kaggle_session_failed(self, message):
+        self.progress_bar.setValue(0)
+        self.kaggle_status.setText("Kaggle: session upload failed")
+        self.label_status.setText("Kaggle session upload failed. See console.")
+        print(message)
+        short = str(message)
+        if len(short) > 1800:
+            short = short[:1800] + "\n..."
+        QMessageBox.warning(self, "Kaggle session upload failed", short)
+
+    def _on_kaggle_session_finished(self):
+        self.kaggle_session_thread = None
+        self.btn_predict.setEnabled(True)
+        self.btn_apply.setEnabled(True)
+        self.update_apply_button_text()
+        self.refresh_kaggle_status()
+
+    def _spawn_session_cleanup(self, stale_hours=None):
+        """Delete the remote session dataset in a detached process."""
+        if not KAGGLE_UI_AVAILABLE:
+            return
+        cmd = [sys.executable, "-m", "kaggle_bridge", "session-cleanup", "--quiet"]
+        if stale_hours is not None:
+            cmd += ["--stale-hours", str(stale_hours)]
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NO_WINDOW", 0
+        )
+        try:
+            subprocess.Popen(
+                cmd,
+                cwd=_REPO_ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=flags,
+                close_fds=True,
+                start_new_session=(os.name != "nt"),
+            )
+        except Exception as exc:
+            print("Kaggle session cleanup spawn failed:", exc)
+
+    def cleanup_kaggle_session(self):
+        """Called by QApplication.aboutToQuit: wait for a running job, then delete."""
+        if not KAGGLE_UI_AVAILABLE:
+            return
+        # Wait for a running job so coordinates are not lost.  Cap the wait
+        # so a queued Kaggle job cannot keep the whole app open for hours.
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Kaggle job running",
+                "A Kaggle job is still running. LabelImg will wait for it to "
+                "finish before deleting the session image dataset.",
+            )
+            if not self.kaggle_thread.wait(10 * 60 * 1000):
+                print("Kaggle job still running; leaving the session dataset for next launch.")
+                return
+        if (
+            self.kaggle_session_thread is not None
+            and self.kaggle_session_thread.isRunning()
+        ):
+            if not self.kaggle_session_thread.wait(10 * 60 * 1000):
+                print("Session upload still running; leaving it for next launch.")
+                return
+        self._spawn_session_cleanup()
+
+    def on_kaggle_toggled(self, checked):
+        if checked and not KAGGLE_UI_AVAILABLE:
+            self.chk_kaggle.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "Kaggle unavailable",
+                KAGGLE_UI_ERROR or "The Kaggle bridge could not be imported.",
+            )
+            return
+        self.btn_predict.setText("Predict on Kaggle" if checked else "Predict")
+        self.update_apply_button_text()
+        self.update_sam2_model_label()
+        if checked:
+            self.label_status.setText(
+                "Kaggle mode ON: Predict and Dynamic SAM 2 will run on T4 x2."
+            )
+            self.start_kaggle_session_prepare()
+        else:
+            self.label_status.setText("Kaggle mode OFF: heavy work runs locally.")
+
+    def open_kaggle_settings(self):
+        if not KAGGLE_UI_AVAILABLE:
+            QMessageBox.warning(
+                self, "Kaggle unavailable", KAGGLE_UI_ERROR or "Bridge import failed."
+            )
+            return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is running. Try again when it finishes.")
+            return
+        try:
+            dlg = KaggleSettingsDialog(self)
+            dlg.exec_()
+        except Exception as exc:
+            QMessageBox.critical(self, "Kaggle setup", f"{exc}")
+            print(traceback.format_exc())
+        self.refresh_kaggle_status()
+
+    def open_kaggle_jobs(self):
+        if not KAGGLE_UI_AVAILABLE:
+            QMessageBox.warning(
+                self, "Kaggle unavailable", KAGGLE_UI_ERROR or "Bridge import failed."
+            )
+            return
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is running. Wait for it to finish.")
+            return
+        try:
+            dlg = KaggleJobsDialog(self)
+            dlg.resume_requested.connect(self.resume_kaggle_job)
+            dlg.exec_()
+        except Exception as exc:
+            QMessageBox.critical(self, "Kaggle jobs", f"{exc}")
+            print(traceback.format_exc())
+        self.refresh_kaggle_status()
+
+    def resume_kaggle_job(self, job_id):
+        if self.kaggle_thread is not None and self.kaggle_thread.isRunning():
+            self.label_status.setText("A Kaggle job is already running.")
+            return
+        try:
+            thread = KaggleJobThread(job_id=job_id, resume=True, parent=self)
+        except Exception as exc:
+            QMessageBox.critical(self, "Kaggle resume", f"{exc}")
+            return
+        self._wire_kaggle_thread(thread)
+        self._start_kaggle_thread(thread, f"Resuming {job_id}")
+
+    def start_kaggle_predict(self):
+        from kaggle_bridge.spec import JobSpec, SpecError
+
+        model_name = self.combo_models.currentText()
+        if not model_name or model_name == "(no models found)":
+            self.label_status.setText("No model selected.")
+            return
+        images = list_images()
+        if not images:
+            self.label_status.setText("No frames found.")
+            return
+        classes = read_classes()
+        if not classes:
+            self.label_status.setText("classes.txt is empty; cannot map model classes.")
+            return
+        start_idx = max(1, min(int(self.current_index or 1), len(images)))
+        end_idx = max(start_idx, min(int(self.spin_end.value()), len(images)))
+        spec = JobSpec(
+            job_type="yolo_predict",
+            images_dir=IMAGES_DIR,
+            labels_dir=LABELS_DIR,
+            models_dir=MODELS_DIR,
+            images=images,
+            classes=classes,
+            start_index=start_idx,
+            end_index=end_idx,
+            model_path=os.path.join(MODELS_DIR, model_name),
+            selection_area=(
+                self.selection_area if self.chk_area_mode.isChecked() else None
+            ),
+        )
+        try:
+            spec.validate()
+        except SpecError as exc:
+            QMessageBox.warning(self, "Kaggle predict", str(exc))
+            return
+        self._start_kaggle_job(spec, "YOLO predict")
+
+    def start_kaggle_sam2(self):
+        from kaggle_bridge.spec import JobSpec, SpecError
+
+        selected = [list(it.parts) for it in self.bbox_items if it.isSelected()]
+        if not selected:
+            self.sam2_status.setText("Select one or more boxes on the current frame first.")
+            self.label_status.setText("SAM 2: no boxes selected.")
+            return
+        images = list_images()
+        if not images:
+            self.label_status.setText("No frames found.")
+            return
+        classes = read_classes()
+        if not classes:
+            self.label_status.setText("classes.txt is empty; cannot map classes.")
+            return
+        model_key = self.sam2_selected_model_key()
+        checkpoint = (
+            sam2_checkpoint_path(model_key)
+            if sam2_checkpoint_available(model_key)
+            else ""
+        )
+        direction = ["backward", "forward", "entire"][
+            self.combo_sam2_direction.currentIndex()
+        ]
+        start_idx = max(1, min(int(self.current_index or 1), len(images)))
+        end_idx = max(start_idx, min(int(self.spin_end.value()), len(images)))
+        spec = JobSpec(
+            job_type="sam2_track",
+            images_dir=IMAGES_DIR,
+            labels_dir=LABELS_DIR,
+            models_dir=MODELS_DIR,
+            images=images,
+            classes=classes,
+            start_index=start_idx,
+            end_index=end_idx,
+            direction=direction,
+            boxes=selected,
+            min_confidence=self.spin_sam2_conf.value() / 100.0,
+            model_key=model_key,
+            checkpoint_path=checkpoint,
+            sam2_config=SAM2_MODELS[model_key]["config"],
+        )
+        try:
+            spec.validate()
+        except SpecError as exc:
+            QMessageBox.warning(self, "Kaggle SAM 2", str(exc))
+            return
+        self._start_kaggle_job(
+            spec,
+            f"SAM 2 {SAM2_MODELS[model_key]['label'].split(' (')[0]} tracking",
+        )
+
+    def _start_kaggle_job(self, spec, label):
+        if (
+            self.kaggle_session_thread is not None
+            and self.kaggle_session_thread.isRunning()
+        ):
+            QMessageBox.information(
+                self,
+                "Kaggle session",
+                "The current images folder is still uploading to Kaggle. "
+                "Wait for 'Kaggle: session ready' and click again.",
+            )
+            return
+        cfg, blockers = self._kaggle_blockers()
+        if blockers:
+            answer = QMessageBox.question(
+                self,
+                "Kaggle setup needed",
+                "Kaggle is not ready:\n\n- "
+                + "\n- ".join(blockers)
+                + "\n\nOpen Kaggle setup now?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes:
+                self.open_kaggle_settings()
+            return
+        try:
+            thread = KaggleJobThread(spec=spec, parent=self)
+        except Exception as exc:
+            QMessageBox.critical(self, "Kaggle job", f"{exc}")
+            return
+        self._wire_kaggle_thread(thread)
+        self._start_kaggle_thread(thread, label)
+
+    def _wire_kaggle_thread(self, thread):
+        thread.progress.connect(self.on_kaggle_progress)
+        thread.status.connect(self.on_kaggle_status)
+        thread.snapshot.connect(self.on_kaggle_snapshot)
+        thread.changed_files.connect(self.on_kaggle_changed_files)
+        thread.job_created.connect(
+            lambda job_id: self.kaggle_status.setText(f"Kaggle job: {job_id}")
+        )
+        thread.done.connect(self.on_kaggle_done)
+        thread.cancelled.connect(self.on_kaggle_cancelled)
+        thread.failed.connect(self.on_kaggle_failed)
+        thread.finished.connect(lambda: self._on_kaggle_thread_finished(thread))
+
+    def _start_kaggle_thread(self, thread, label):
+        self.kaggle_thread = thread
+        self.set_action_controls_enabled(False)
+        self.btn_kaggle_cancel.setEnabled(True)
+        self.btn_predict.setText("Running on Kaggle...")
+        self.btn_apply.setText("Running on Kaggle...")
+        self.progress_bar.setValue(0)
+        self.kaggle_status.setText(f"Kaggle: preparing {label}...")
+        self.label_status.setText(
+            f"Kaggle: {label} — preparing session/command..."
+        )
+        thread.start()
+
+    def cancel_kaggle_job(self):
+        thread = self.kaggle_thread
+        if thread is None or not thread.isRunning():
+            self.label_status.setText("No Kaggle job is running.")
+            self.btn_kaggle_cancel.setEnabled(False)
+            return
+        answer = QMessageBox.question(
+            self,
+            "Cancel Kaggle job",
+            "Stop the queued/running Kaggle kernel?\n\n"
+            "Already uploaded session images stay until LabelImg closes. "
+            "The local labels will not be changed by a cancelled job.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.btn_kaggle_cancel.setEnabled(False)
+        self.kaggle_status.setText("Kaggle: cancelling...")
+        self.label_status.setText(
+            "Cancelling Kaggle job... waiting for the remote kernel to stop."
+        )
+        thread.cancel()
+
+    def on_kaggle_cancelled(self, message):
+        self.progress_bar.setValue(0)
+        self.set_action_controls_enabled(True)
+        self.btn_kaggle_cancel.setEnabled(False)
+        self.kaggle_status.setText("Kaggle: cancelled")
+        self.label_status.setText(message or "Kaggle job cancelled.")
+        QMessageBox.information(
+            self,
+            "Kaggle job cancelled",
+            "Kaggle job cancelled. Local labels were not changed.",
+        )
+
+    def _on_kaggle_thread_finished(self, thread):
+        if self.kaggle_thread is thread:
+            self.kaggle_thread = None
+        self.btn_kaggle_cancel.setEnabled(False)
+        if getattr(self, "chk_kaggle", None) is not None:
+            self.chk_kaggle.setEnabled(KAGGLE_UI_AVAILABLE)
+        self.btn_predict.setText(
+            "Predict on Kaggle" if self.chk_kaggle.isChecked() else "Predict"
+        )
+        self.set_action_controls_enabled(True)
+        self.refresh_kaggle_status()
+
+    def on_kaggle_progress(self, value):
+        self.progress_bar.setValue(int(value))
+
+    def on_kaggle_status(self, message):
+        self.kaggle_status.setText(message)
+        self.label_status.setText(message)
+
+    def on_kaggle_snapshot(self, files_snapshot):
+        try:
+            if files_snapshot:
+                self.push_undo_snapshot(files_snapshot)
+        except Exception as exc:
+            print("on_kaggle_snapshot error:", exc)
+
+    def on_kaggle_changed_files(self, names):
+        """Jump to the first changed frame so the returned boxes are visible."""
+        try:
+            changed = set(str(name) for name in (names or []))
+            if not changed:
+                return
+            current = None
+            if 1 <= int(self.current_index or 0) <= len(self.images):
+                current = self.images[int(self.current_index) - 1]
+            if current in changed:
+                return
+            for index, name in enumerate(self.images, start=1):
+                if name in changed:
+                    self.current_index = index
+                    if hasattr(self, "spin_index"):
+                        self.spin_index.setValue(index)
+                    self.load_image(index)
+                    self.label_status.setText(
+                        f"Kaggle coordinates loaded: showing {name}"
+                    )
+                    break
+        except Exception as exc:
+            print("on_kaggle_changed_files error:", exc)
+
+    def on_kaggle_done(self, message):
+        self.progress_bar.setValue(100)
+        self.set_action_controls_enabled(True)
+        self.load_image(self.current_index)
+        self.kaggle_status.setText("Kaggle: done")
+        self.label_status.setText(message)
+        QMessageBox.information(self, "Kaggle job finished", message)
+
+    def on_kaggle_failed(self, message):
+        self.progress_bar.setValue(0)
+        self.set_action_controls_enabled(True)
+        self.load_image(self.current_index)
+        self.kaggle_status.setText("Kaggle: job failed")
+        self.label_status.setText("Kaggle job failed. See the message.")
+        print(message)
+        short = str(message)
+        if len(short) > 2200:
+            short = short[:2200] + "\n..."
+        QMessageBox.warning(self, "Kaggle job failed", short)
+
     # ---------------- Shortcuts ----------------
     def setup_shortcuts(self):
         undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
         undo_shortcut.activated.connect(self.perform_undo)
         fit_shortcut = QShortcut(QKeySequence("Ctrl+0"), self)
         fit_shortcut.activated.connect(self.fit_view)
+        select_all_shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
+        select_all_shortcut.activated.connect(self.select_all_boxes)
 
 # Alias to make embedding name clearer without breaking existing imports
 AnnotationHelperPage = AnnotationApp

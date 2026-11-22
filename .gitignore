@@ -58,6 +58,7 @@ annotation_helper/sam2_models/
 annotation_helper/models/
 models/
 # Datasets / bulk media (never commit)
+Dset/
 Dataset_new/
 dataset2/
 merged_data/
@@ -71,3 +72,12 @@ guarding-cameras-batch2-buckets-20260824_k/
 # One-off local scripts (kept in dev folder only)
 annotation_helper/app.py
 annotation_helper/labelImg.py
+
+# Kaggle cloud offload: local secrets, state and the dedicated CLI venv
+.env
+.env.*
+!.env.example
+.kaggle-venv/
+kaggle_jobs/
+kaggle_weights/
+*.kaggle-partial

@@ -32,6 +32,22 @@ It helps with:
 
 ![Annotation Helper Window](assets/annotation_helper-ui.png)
 
+### Optional: Kaggle T4 x2 Offload
+
+Heavy YOLO prediction and Dynamic SAM 2 tracking can run on Kaggle's 2x T4
+GPUs instead of the local machine.  Models/checkpoints are uploaded once to a
+private Kaggle weights dataset; the current images folder is uploaded once per
+app session.  Later clicks send only a small command (~0.5-1 KB), reuse the
+fixed kernel, and return only YOLO coordinates.  The changed frame is shown in
+LabelImg (with Undo).  A **Cancel Kaggle job** button stops a queued/running
+kernel.  T4 x2 is tried first; after a fixed 1-minute queue it tries L4 x1,
+H100, then A100.  If no GPU is allocated the job stops (CPU is not used), and
+LabelImg shows the reason.  **Kaggle setup → Check GPUs** probes the actual
+GPUs first.  Closing LabelImg deletes the session image dataset.
+
+Setup, quotas, troubleshooting and the full architecture are in
+[annotation_helper/KAGGLE_SAM2.md](annotation_helper/KAGGLE_SAM2.md).
+
 ## ⚠️ Current Format Support
 
 LabelImg Plus currently supports **YOLO format (.txt)** for all annotation operations.
@@ -48,7 +64,10 @@ Support for additional formats is under development and will be available in fut
 labelimg/
 ├── annotation_helper/
 │   ├── models/                         # Place your trained or pretrained PyTorch (.pt) models here
+│   ├── kaggle_ui.py                    # Optional Kaggle T4 x2 UI/threads
+│   ├── KAGGLE_SAM2.md                  # Cloud offload setup + troubleshooting
 │   └── annotation_helper_current.py    # Main Annotation Helper logic and UI
+├── kaggle_bridge/                      # Kaggle job bundling, CLI wrapper, kernel runner
 │
 ├── labelImg.py                         # Main application entry point
 ├── libs/                               # Core LabelImg libraries
